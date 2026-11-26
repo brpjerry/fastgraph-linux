@@ -52,7 +52,7 @@ jobs:
         run: |
           cd /build
           cp PKGBUILD PKGBUILD-fastgraph
-          sha256sum ./*.pkg.tar.zst PKGBUILD-fastgraph > SHA256SUMS
+          sha256sum fastgraph-*.pkg.tar.zst PKGBUILD-fastgraph > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --title "fastgraph ${GITHUB_REF_NAME#v}" --generate-notes \
             ./*.pkg.tar.zst PKGBUILD-fastgraph SHA256SUMS
