@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 fastgraph-core = { path = "../fastgraph-core" }
+libc = "0.2"
 # Wayland only: no `x11` feature.
 iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "wayland", "canvas", "thread-pool", "fira-sans", "crisp", "selector", "advanced"] }
 # xdg-desktop-portal dialogs; no GTK.

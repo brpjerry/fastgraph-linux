@@ -682,6 +682,7 @@ dependencies = [
  "iced",
  "iced_runtime",
  "iced_test",
+ "libc",
  "png",
  "rfd",
  "tempfile",
@@ -693,6 +694,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "hound",
+ "libc",
  "pipewire",
  "realfft",
  "serde",
