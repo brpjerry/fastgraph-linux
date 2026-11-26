@@ -127,11 +127,6 @@ impl App {
                 if self.prefs.theme != mode {
                     self.prefs.theme = mode;
                     self.save_prefs();
-                    // The default accent and traces are the mode's own.
-                    if self.prefs.accent.is_none() {
-                        self.settings.accent = to_hex(palette(&self.prefs).accent);
-                    }
-                    self.sync_default_traces();
                     self.apply_colors();
                 }
             }
@@ -140,7 +135,6 @@ impl App {
                 if let Some(color) = parse_hex(&self.settings.accent) {
                     self.prefs.accent = Some(to_hex(color));
                     self.save_prefs();
-                    self.sync_default_traces();
                     self.apply_colors();
                 }
             }
@@ -148,7 +142,6 @@ impl App {
                 self.prefs.accent = None;
                 self.save_prefs();
                 self.settings.accent = to_hex(palette(&self.prefs).accent);
-                self.sync_default_traces();
                 self.apply_colors();
             }
             Message::TraceColorInput(index, text) => {
@@ -179,17 +172,23 @@ impl App {
     }
 
     /// Install the mode and colours the preferences name: the graph's cached
-    /// strokes have the old ones.
+    /// strokes have the old ones. A colour box still showing a colour that
+    /// changed shows the new one; one holding other text keeps it.
     fn apply_colors(&mut self) {
+        let before = Palette::of(&self.theme);
         self.theme = theme::from_prefs(&self.prefs);
-        self.graph.colors_changed();
-    }
-
-    /// While the trace colours are the theme's, their boxes follow the accent.
-    fn sync_default_traces(&mut self) {
-        if self.prefs.trace_colors.is_none() {
-            self.settings.traces = palette(&self.prefs).traces.map(to_hex);
+        let after = Palette::of(&self.theme);
+        let follow = |input: &mut String, old: iced::Color, new: iced::Color| {
+            let (old, new) = (to_hex(old), to_hex(new));
+            if old != new && parse_hex(input).map(to_hex) == Some(old) {
+                *input = new;
+            }
+        };
+        follow(&mut self.settings.accent, before.accent, after.accent);
+        for (i, input) in self.settings.traces.iter_mut().enumerate() {
+            follow(input, before.traces[i], after.traces[i]);
         }
+        self.graph.colors_changed();
     }
 }
 

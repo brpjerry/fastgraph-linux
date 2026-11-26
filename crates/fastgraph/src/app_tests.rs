@@ -1507,7 +1507,10 @@ fn render_snapshots() {
     for name in ["Velour pads", "Leather pads"] {
         write_pads(saves.path(), name, "Left");
     }
-    app.prefs.sets_dir = Some(saves.path().to_path_buf());
+    run(
+        &mut app,
+        Message::SetsDirPicked(Some(saves.path().to_path_buf())),
+    );
     for n in 0..app.items.len() {
         let item = id(&app, n);
         app.distortion
@@ -1522,7 +1525,7 @@ fn render_snapshots() {
         for (view, name, hover) in [
             (graph::View::Response, "response", 4.0),
             (graph::View::Phase, "phase", -90.0),
-            (graph::View::Distortion, "distortion", -60.0),
+            (graph::View::Distortion, "distortion", -1.0),
         ] {
             run(&mut app, Message::GraphViewSelected(view));
             run(
@@ -2651,6 +2654,70 @@ fn switching_the_appearance_rebuilds_the_theme_and_redraws_the_graph() {
     assert_eq!(Some(p.accent), theme::parse_hex("#30a0f0"));
     assert_eq!(app.settings.accent, "#30a0f0");
     assert_eq!(draws(&app), custom + 1);
+}
+
+// A colour typed but not yet entered survives a switch; a box that shows the
+// old appearance's colour takes the new one, also where a saved colour is
+// invalid and the default is drawn in its place.
+// Bugs caught: 0, False positives: 0
+#[test]
+fn switching_the_appearance_keeps_typed_colours_and_updates_shown_ones() {
+    let mut app = plain(None);
+    run(&mut app, Message::AccentInput("#30a0".into()));
+    run(&mut app, Message::TraceColorInput(2, "#00ff00".into()));
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    let light = Palette::of(&app.theme());
+    assert_eq!(
+        light,
+        Palette::new(ThemeMode::Light, theme::ACCENT_LIGHT, None)
+    );
+    assert_eq!(app.settings.accent, "#30a0");
+    for (i, shown) in app.settings.traces.iter().enumerate() {
+        let want = if i == 2 {
+            "#00ff00".to_string()
+        } else {
+            theme::to_hex(light.traces[i])
+        };
+        assert_eq!(*shown, want, "trace {i}");
+    }
+
+    let prefs = Prefs {
+        accent: Some("#zz".into()),
+        trace_colors: Some(vec!["#123456".into(); 3]),
+        ..Prefs::default()
+    };
+    let mut app = App::new_for_test(prefs, None);
+    assert_eq!(app.settings.accent, theme::to_hex(theme::ACCENT));
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    let light = Palette::of(&app.theme());
+    assert_eq!(
+        light,
+        Palette::new(ThemeMode::Light, theme::ACCENT_LIGHT, None)
+    );
+    assert_eq!(app.settings.accent, theme::to_hex(light.accent));
+    assert_eq!(app.settings.traces, light.traces.map(theme::to_hex));
+}
+
+// The RTA average stays drawn after Stop, dashed in the foreground colour:
+// a new appearance redraws it at the same window size.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn switching_the_appearance_redraws_a_stopped_rta_average() {
+    let mut app = rta_ready(None);
+    run(&mut app, Message::RtaListen(true));
+    run(&mut app, rta_event(-30.0, 12));
+    run(&mut app, Message::RtaListen(false));
+    assert!(app.rta.live.is_some(), "the average stays after Stop");
+    let draws = |app: &App| {
+        crate::testing::ui(crate::testing::SIZE, app.view())
+            .snapshot(&app.theme())
+            .expect("headless render");
+        app.graph.live_drawn.get()
+    };
+    let before = draws(&app);
+    assert_eq!(draws(&app), before, "cached");
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    assert_eq!(draws(&app), before + 1, "redrawn in the light foreground");
 }
 
 /// A response tilting 6 dB per octave through 0 dB at 1 kHz.

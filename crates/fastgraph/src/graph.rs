@@ -560,6 +560,9 @@ pub struct Graph {
     /// How many times the cached layer was drawn.
     #[cfg(test)]
     pub(crate) drawn: Cell<usize>,
+    /// How many times the live layer was drawn.
+    #[cfg(test)]
+    pub(crate) live_drawn: Cell<usize>,
 }
 
 impl Default for Graph {
@@ -581,6 +584,8 @@ impl Default for Graph {
             live_cache: Cache::new(),
             #[cfg(test)]
             drawn: Cell::new(0),
+            #[cfg(test)]
+            live_drawn: Cell::new(0),
         }
     }
 }
@@ -820,9 +825,11 @@ impl Graph {
         self.cache.clear();
     }
 
-    /// The colours changed: redraw the traces in the new ones.
+    /// The colours changed: redraw the traces and the live average in the
+    /// new ones.
     pub fn colors_changed(&self) {
         self.cache.clear();
+        self.live_cache.clear();
     }
 
     /// Show the RTA's average (or none). Only the live layer is redrawn,
@@ -1194,6 +1201,8 @@ impl canvas::Program<Event> for Plot<'_> {
             }
         });
         let live = graph.live_cache.draw(renderer, size, |frame| {
+            #[cfg(test)]
+            graph.live_drawn.set(graph.live_drawn.get() + 1);
             if let (View::Response, Some(response)) = (graph.view, &graph.live) {
                 let pin = graph.pins();
                 draw_live(frame, &plot, response, top_db, pin, &p);

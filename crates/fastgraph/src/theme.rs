@@ -146,13 +146,13 @@ const LIGHT: Base = Base {
     fg_faint: color!(0x9a9a9a),
     disabled: 0.5,
     ok: color!(0x1e7f3a),
-    warn: color!(0xa85a00),
-    err: color!(0xc62828),
+    warn: color!(0x924a00),
+    err: color!(0xaf2020),
     // The dark hues deepened: each has at least 3:1 on the background and
     // on a major grid line.
     traces: [
         color!(0x1f6fb5),
-        color!(0xb35c00),
+        color!(0xb15a00),
         color!(0x2a7f3c),
         color!(0x7b4fc9),
         color!(0x8a6d00),
@@ -187,13 +187,7 @@ impl Palette {
             fg_faint: base.fg_faint,
             disabled: mix(fg, bg, base.disabled),
             accent,
-            // Black on a light accent, white on a dark one: whichever
-            // contrasts more (they tie at a luminance of 0.179).
-            accent_fg: if luminance(accent) > 0.179 {
-                Color::BLACK
-            } else {
-                Color::WHITE
-            },
+            accent_fg: text_on_fill(accent),
             accent_dim: mix(accent, bg, 0.5),
             // The hover, pressed and selected tints: the accent at
             // 0x24, 0x3d and 0x2e over the background, flattened (see `over`).
@@ -210,12 +204,7 @@ impl Palette {
     /// The palette the preferences describe: their mode, accent and trace
     /// colours, each defaulting to the mode's own.
     pub fn from_prefs(prefs: &Prefs) -> Self {
-        let accent = prefs.accent.as_deref().and_then(parse_hex);
-        Self::new(
-            prefs.theme,
-            accent.unwrap_or(default_accent(prefs.theme)),
-            trace_colors(prefs),
-        )
+        Self::new(prefs.theme, pref_accent(prefs), trace_colors(prefs))
     }
 
     /// The palette `theme` was made with by [`with_colors`]. A theme with a
@@ -249,6 +238,16 @@ fn mode_of(background: Color) -> ThemeMode {
     } else {
         ThemeMode::Dark
     }
+}
+
+/// The accent the preferences set, or the mode's default if they set none
+/// validly.
+fn pref_accent(prefs: &Prefs) -> Color {
+    prefs
+        .accent
+        .as_deref()
+        .and_then(parse_hex)
+        .unwrap_or_else(|| default_accent(prefs.theme))
 }
 
 /// The trace colours the preferences set, if they set all eight validly.
@@ -332,9 +331,7 @@ pub fn with_colors(
 
 /// The theme the preferences describe.
 pub fn from_prefs(prefs: &Prefs) -> Theme {
-    let p = Palette::from_prefs(prefs);
-    let traces = trace_colors(prefs);
-    with_colors(prefs.theme, p.accent, traces)
+    with_colors(prefs.theme, pref_accent(prefs), trace_colors(prefs))
 }
 
 // --- type ------------------------------------------------------------------
@@ -566,14 +563,23 @@ pub fn button(theme: &Theme, status: widget::button::Status) -> widget::button::
     }
 }
 
-/// A bare text button: no frame, primary text, the accent on hover.
+/// A bare text button: no frame, primary text, the accent on hover where it
+/// reads on the window and on a selected row.
 pub fn name_button(theme: &Theme, status: widget::button::Status) -> widget::button::Style {
     let p = Palette::of(theme);
-    let color = if hovered(status) { p.accent } else { p.fg };
+    let color = if hovered(status)
+        && contrast(p.accent, p.bg) >= 4.5
+        && contrast(p.accent, p.selected) >= 4.5
+    {
+        p.accent
+    } else {
+        p.fg
+    };
     button_style(None, color, Border::default())
 }
 
-/// The one action a view confirms with: accent fill, `accent_fg` text.
+/// The one action a view confirms with: accent fill, `accent_fg` text;
+/// hovered or pressed, text that reads on that fill.
 pub fn primary(theme: &Theme, status: widget::button::Status) -> widget::button::Style {
     let p = Palette::of(theme);
     match status {
@@ -584,15 +590,14 @@ pub fn primary(theme: &Theme, status: widget::button::Status) -> widget::button:
                 widget::button::Status::Pressed => p.accent_dim,
                 _ => p.accent,
             };
-            button_style(
-                Some(fill),
-                if status == widget::button::Status::Pressed {
-                    p.fg
-                } else {
-                    p.accent_fg
-                },
-                border(fill),
-            )
+            let text = match status {
+                widget::button::Status::Pressed if contrast(p.fg, fill) >= 4.5 => p.fg,
+                widget::button::Status::Hovered | widget::button::Status::Pressed => {
+                    text_on_fill(fill)
+                }
+                _ => p.accent_fg,
+            };
+            button_style(Some(fill), text, border(fill))
         }
     }
 }
@@ -722,7 +727,7 @@ pub fn check(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
     };
     checkbox::Style {
         background: Background::Color(fill),
-        icon_color: p.accent_fg,
+        icon_color: if disabled { p.disabled } else { p.accent_fg },
         border: border(edge),
         text_color: Some(if disabled { p.disabled } else { p.fg }),
     }
@@ -797,6 +802,16 @@ pub fn scrollbar(theme: &Theme, status: scrollable::Status) -> scrollable::Style
     style.vertical_rail = rail;
     style.horizontal_rail = rail;
     style
+}
+
+/// Black text on a light fill, white on a dark one: whichever contrasts
+/// more (they tie at a luminance of 0.179).
+fn text_on_fill(fill: Color) -> Color {
+    if luminance(fill) > 0.179 {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    }
 }
 
 /// WCAG relative luminance.
@@ -912,6 +927,29 @@ mod tests {
         }
     }
 
+    // The status and trace colours also serve as small text: the clipped
+    // caption on a selected row, invalid text selected in a colour box and
+    // the harmonic names on the plot.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn status_and_trace_colours_read_as_small_text_where_they_are_text() {
+        for mode in MODES {
+            let theme = default_theme(mode);
+            let p = Palette::of(&theme);
+            for (role, color) in [("warn", p.warn), ("err", p.err)] {
+                let ratio = contrast(color, p.selected);
+                assert!(ratio >= 4.5, "{mode:?} {role} on selected: {ratio:.2}");
+            }
+            let bad = input_checked(false)(&theme, widget::text_input::Status::Active);
+            let ratio = contrast(bad.value, bad.selection);
+            assert!(ratio >= 4.5, "{mode:?} selected invalid text: {ratio:.2}");
+            for (i, &trace) in p.traces.iter().enumerate() {
+                let ratio = contrast(trace, p.bg);
+                assert!(ratio >= 4.5, "{mode:?} trace {i} on the plot: {ratio:.2}");
+            }
+        }
+    }
+
     // Bugs caught: 0, False positives: 0
     #[test]
     fn light_default_traces_have_three_to_one_on_the_light_surfaces() {
@@ -1014,6 +1052,46 @@ mod tests {
         }
     }
 
+    // Labels and checkmarks read on the fill drawn under them: a hovered or
+    // pressed accent fill, a disabled checked box, a hovered name on the
+    // window or a selected row. The accent itself stays the fill.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn labels_and_checkmarks_read_on_the_fill_of_each_state() {
+        use widget::button::Status;
+        let fill_of = |background: Option<Background>| match background {
+            Some(Background::Color(fill)) => fill,
+            other => panic!("{other:?}"),
+        };
+        for mode in MODES {
+            for hex in [None, Some("#777777"), Some("#ffffff"), Some("#ffff00")] {
+                let accent = hex.map_or(default_accent(mode), |h| parse_hex(h).unwrap());
+                let theme = with_colors(mode, accent, None);
+                let p = Palette::of(&theme);
+                assert_eq!(fill_of(primary(&theme, Status::Active).background), accent);
+                for status in [Status::Active, Status::Hovered, Status::Pressed] {
+                    let style = primary(&theme, status);
+                    let ratio = contrast(style.text_color, fill_of(style.background));
+                    assert!(ratio >= 4.5, "{mode:?} {hex:?} {status:?}: {ratio:.2}");
+                    let name = name_button(&theme, status).text_color;
+                    for surface in [p.bg, p.selected] {
+                        let ratio = contrast(name, surface);
+                        assert!(ratio >= 4.5, "{mode:?} {hex:?} name {status:?}: {ratio:.2}");
+                    }
+                }
+                let on = check(&theme, checkbox::Status::Active { is_checked: true });
+                assert_eq!(on.background, Background::Color(accent));
+                assert!(contrast(on.icon_color, accent) >= 4.5, "{mode:?} {hex:?}");
+                let off = check(&theme, checkbox::Status::Disabled { is_checked: true });
+                let Background::Color(fill) = off.background else {
+                    panic!("{:?}", off.background);
+                };
+                assert_eq!(off.icon_color, p.disabled);
+                assert!(contrast(off.icon_color, fill) >= 2.5, "{mode:?} {hex:?}");
+            }
+        }
+    }
+
     // Bugs caught: 0, False positives: 0
     #[test]
     fn trace_colours_cycle_from_the_accent_and_are_distinct() {
@@ -1037,6 +1115,7 @@ mod tests {
         let green = parse_hex("#00ff00").unwrap();
         let mut traces = Palette::default().traces;
         traces[3] = green;
+        let light = with_colors(ThemeMode::Light, ACCENT, None);
         let custom = with_colors(ThemeMode::Dark, ACCENT, Some(traces));
         assert_eq!(Palette::of(&custom).trace(3), green);
         // Another theme does not get them, though they were set last.
@@ -1047,7 +1126,6 @@ mod tests {
         );
         assert_eq!(Palette::of(&custom).trace(3), green);
         // Nor does the other mode with the same accent.
-        let light = with_colors(ThemeMode::Light, ACCENT, None);
         assert_eq!(
             Palette::of(&light).traces,
             Palette::new(ThemeMode::Light, ACCENT, None).traces
