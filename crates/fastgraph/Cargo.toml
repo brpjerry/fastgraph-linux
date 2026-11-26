@@ -10,9 +10,10 @@ fastgraph-core = { path = "../fastgraph-core" }
 iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "wayland", "canvas", "thread-pool", "fira-sans", "crisp", "selector", "advanced"] }
 # xdg-desktop-portal dialogs; no GTK.
 rfd = "0.18"
+# Export PNG: the off-screen draw (already a dependency of iced) and the encoder.
+iced_runtime = "0.14"
+png = "0.18"
 
 [dev-dependencies]
 iced_test = "0.14"
 tempfile = "3"
-# Runs the tasks `App::update` returns (`app_tests::run`).
-iced_runtime = "0.14"

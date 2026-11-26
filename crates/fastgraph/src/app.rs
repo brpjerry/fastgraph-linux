@@ -9,7 +9,7 @@ use crate::devices::Opened;
 use crate::settings::Inputs;
 pub use crate::status::{Status, StatusLevel};
 use crate::store_queue::Worker;
-use crate::{browser, devices, graph, list, rta_mode, settings, tabs, theme, toolbar};
+use crate::{browser, devices, export_png, graph, list, rta_mode, settings, tabs, theme, toolbar};
 use fastgraph_core::EventSink;
 use fastgraph_core::audio::{AudioCommand, AudioEvent, Engine, Node};
 use fastgraph_core::deconv::ImpulseResponse;
@@ -21,7 +21,7 @@ use fastgraph_core::signal::{SweepLength, sweep_file_name, sweep_stimulus, write
 use fastgraph_core::store::{Kind, Measurement, Meta, Side, Store};
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use iced::futures::{Stream, StreamExt, stream};
-use iced::widget::{Space, column, container, row, rule};
+use iced::widget::{Space, column, container, responsive, row, rule, stack};
 use iced::{Element, Length, Subscription, Task};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -177,6 +177,8 @@ pub struct App {
     #[cfg(test)]
     pub(crate) sent: std::cell::RefCell<Vec<rta_mode::Sent>>,
     pub(crate) graph: graph::Graph,
+    /// The Export PNG panel, while it is open.
+    pub(crate) png: Option<export_png::Options>,
 }
 
 pub struct Item {
@@ -278,6 +280,8 @@ pub enum Message {
     /// Export the item with this id.
     Export(String),
     Exported(Result<PathBuf, String>),
+    /// The Export PNG button and panel.
+    Png(export_png::Event),
     AverageShown,
     /// Start renaming the item with this id.
     RenameStart(String),
@@ -654,6 +658,7 @@ impl App {
             #[cfg(test)]
             sent: Default::default(),
             graph: graph::Graph::default(),
+            png: None,
         }
     }
 
@@ -852,6 +857,7 @@ impl App {
             Message::Export(id) => return self.export(&id),
             Message::Exported(Ok(path)) => self.info(format!("Exported {}", path.display())),
             Message::Exported(Err(e)) => self.error(format!("Export failed: {e}")),
+            Message::Png(event) => return self.png_event(event),
             Message::AverageShown => return self.average_shown(),
             Message::RenameStart(id) => return self.rename_start(&id),
             Message::RenameInput(name) => self.rename_input(name),
@@ -884,6 +890,7 @@ impl App {
                 self.graph.set_view(view);
                 self.hover = None;
                 self.redraw();
+                self.png_refill();
             }
             Message::UnitsPicked(units) => {
                 // The other units are another axis.
@@ -892,6 +899,7 @@ impl App {
                 }
                 self.units = units;
                 self.redraw();
+                self.png_refill();
             }
             Message::Select(id) => {
                 // Clicking the selected row again deselects it.
@@ -1748,28 +1756,20 @@ impl App {
     // --- view ----------------------------------------------------------------
 
     pub fn view(&self) -> Element<'_, Message> {
-        let (controls, actions) = toolbar::view(self);
-        // Line 1: the view tabs, shrinking below their width only when the
-        // import and average buttons at the right need the room; the same in
-        // every view. Line 2: the controls, which wrap by whole groups.
-        let tabs = container(tabs::pill_tabs(
-            &graph::VIEWS,
-            tabs::position(&self.graph_slide, self.now),
-            Length::Fill,
-            Message::GraphViewSelected,
-        ))
-        .width(Length::Fill)
-        .max_width(GRAPH_TABS_WIDTH);
+        let graph = self
+            .graph
+            .view(self.hover, !self.items.is_empty())
+            .map(Message::Graph);
+        let graph = match &self.png {
+            Some(options) => stack![graph, export_png::panel(options)].into(),
+            None => graph,
+        };
+        // The header knows its width, to place Export PNG….
+        let header = responsive(|size| self.header(size.width)).height(Length::Shrink);
         let main = column![
-            row![container(tabs).width(Length::Fill), actions]
-                .spacing(10)
-                .align_y(iced::Alignment::Center),
+            header,
             Space::new().height(GRAPH_MARGIN),
-            controls,
-            Space::new().height(GRAPH_MARGIN),
-            self.graph
-                .view(self.hover, !self.items.is_empty())
-                .map(Message::Graph),
+            graph,
             rule::horizontal(1).style(theme::rule),
             list::view(self),
         ];
@@ -1791,6 +1791,32 @@ impl App {
             .padding(14),
             rule::vertical(1).style(theme::rule),
             container(main).padding([8, 8]),
+        ]
+        .into()
+    }
+
+    /// The lines over the graph, `width` wide. Line 1: the view tabs,
+    /// shrinking below their width only when the buttons at the right need
+    /// the room; the same in every view. Export PNG… joins them only where
+    /// it leaves the tabs their width. Line 2: the controls, which wrap by
+    /// whole groups.
+    fn header(&self, width: f32) -> Element<'_, Message> {
+        let on_tabs_line = toolbar::png_on_tabs_line(width, GRAPH_TABS_WIDTH);
+        let (controls, actions) = toolbar::view(self, on_tabs_line);
+        let tabs = container(tabs::pill_tabs(
+            &graph::VIEWS,
+            tabs::position(&self.graph_slide, self.now),
+            Length::Fill,
+            Message::GraphViewSelected,
+        ))
+        .width(Length::Fill)
+        .max_width(GRAPH_TABS_WIDTH);
+        column![
+            row![container(tabs).width(Length::Fill), actions]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            Space::new().height(GRAPH_MARGIN),
+            controls,
         ]
         .into()
     }
@@ -1817,6 +1843,16 @@ impl App {
                 _ => None,
             })
         });
+        // Escape closes the Export PNG panel.
+        let png_escape = self.png.is_some().then(|| {
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::Png(export_png::Event::Cancel)),
+                _ => None,
+            })
+        });
         let close = iced::window::close_requests().map(|_| Message::CloseRequested);
         // Startup timing: the first redraw request comes after the first `view`.
         let first_frame = crate::exit_after_first_frame()
@@ -1830,6 +1866,7 @@ impl App {
                 .into_iter()
                 .chain(tick)
                 .chain(escape)
+                .chain(png_escape)
                 .chain(first_frame)
                 .chain(slide),
         )

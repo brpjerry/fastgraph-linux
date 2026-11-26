@@ -26,6 +26,9 @@ use iced::{Element, Length, Point, Rectangle, Renderer, Size, Theme};
 use std::borrow::Cow;
 use std::cell::Cell;
 
+mod export;
+pub(crate) use export::{Export, LegendEntry};
+
 /// Shown on an empty graph.
 pub const EMPTY: &str = "No measurements yet — Measure, Listen, or Import";
 /// Shown on an empty graph while the list has measurements, all hidden.
@@ -591,6 +594,8 @@ pub struct Graph {
     /// Advanced by a zoom, a reset or a view change, which end any pan
     /// begun before them.
     generation: u64,
+    /// Set on an off-screen copy drawn for a PNG export.
+    export: Option<Export>,
     cache: Cache,
     /// The live trace's own layer, cleared on every RTA update.
     live_cache: Cache,
@@ -618,6 +623,7 @@ impl Default for Graph {
             distortion_note: NO_DISTORTION.to_string(),
             zooms: Default::default(),
             generation: 0,
+            export: None,
             cache: Cache::new(),
             live_cache: Cache::new(),
             #[cfg(test)]
@@ -700,6 +706,14 @@ impl Graph {
         };
         let (plot, top) = self.default_axis(plot);
         match zoom.level {
+            // An export shows exactly the range asked for.
+            Some(r) if self.export.is_some() => (
+                PlotBox {
+                    span: r.span(),
+                    ..plot
+                },
+                r.high,
+            ),
             // Within this size's limits, about the saved centre, so a range
             // saved at another size is drawn as the wheel would leave it.
             Some(r) => {
@@ -717,7 +731,10 @@ impl Graph {
     /// Whether traces beyond the level axis are pinned to its edge, as on
     /// the automatic fit, rather than cut, as on a zoomed axis.
     fn pins(&self) -> bool {
-        self.zoom().level.is_none()
+        match &self.export {
+            Some(export) => export.pins,
+            None => self.zoom().level.is_none(),
+        }
     }
 
     /// The current view's zoom.
@@ -851,6 +868,10 @@ impl Graph {
     /// The scroll bars on `plot` (before any zoom): one for each zoomed
     /// axis that does not show all of its full range.
     pub(crate) fn bars(&self, plot: PlotBox) -> Bars {
+        // An export shows its range as asked, with nothing to scroll.
+        if self.export.is_some() {
+            return Bars::default();
+        }
         let ranges = self.zoomed_ranges(plot);
         let narrower = |bar: &Bar| bar.shown.span() < bar.full.span() * (1.0 - 1e-9);
         Bars {
@@ -1011,7 +1032,7 @@ impl Graph {
     /// measurements.
     pub fn view(&self, hover: Option<(f64, f64)>, rows: bool) -> Element<'_, Event> {
         let layers = self.layers(hover, rows);
-        let reset = self.is_zoomed().then(reset_button);
+        let reset = (self.is_zoomed() && self.export.is_none()).then(reset_button);
         Stack::with_children(layers).extend(reset).into()
     }
 
@@ -1684,6 +1705,9 @@ impl canvas::Program<Event> for Plot<'_> {
                     draw_distortion_hover(&mut overlay, &plot, graph, top_db, freq, db, &p);
                 }
             }
+        }
+        if let Some(rows) = graph.export.as_ref().and_then(|e| e.legend.as_deref()) {
+            export::draw_legend(&mut overlay, &plot, graph, top_db, rows, &p);
         }
         vec![base, live, overlay.into_geometry()]
     }

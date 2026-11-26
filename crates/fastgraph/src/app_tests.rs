@@ -1589,7 +1589,7 @@ fn the_toolbar_has_the_same_groups_in_every_view() {
     ] {
         let mut app = plain(None);
         run(&mut app, Message::GraphViewSelected(view));
-        let (controls, actions) = crate::toolbar::view(&app);
+        let (controls, actions) = crate::toolbar::view(&app, true);
         // One headless window at a time: each holds the GPU lock until dropped.
         {
             let mut ui = crate::testing::ui(crate::testing::SIZE, controls);
@@ -3830,7 +3830,7 @@ fn clear_is_offered_whenever_there_is_something_to_reset() {
     assert!(app.is_pristine());
 }
 
-// Bugs caught: 2, False positives: 0
+// Bugs caught: 3, False positives: 0
 #[test]
 fn the_graph_tabs_keep_their_width_while_there_is_room() {
     let app = plain(None);
@@ -4128,4 +4128,149 @@ fn scroll_bars_appear_when_zoomed_and_reset_view_clears_the_pan() {
     assert_eq!(shown(&app), default);
     assert_eq!(app.graph.bars(plot), graph::Bars::default());
     assert!(reset_view_clicked(&app).is_none());
+}
+
+// Export PNG… joins the tabs' line where it leaves the tabs their width, and
+// ends the controls' last line where it does not; either way the lines over
+// the graph keep their places.
+// Bugs caught: 0, False positives: 0
+#[test]
+fn the_export_png_button_leaves_the_header_in_place() {
+    let app = plain(None);
+    let mut starts = Vec::new();
+    for (width, on_tabs_line) in [(900.0, false), (1280.0, true)] {
+        let mut ui = crate::testing::ui((width, 800.0), app.view());
+        let button = ui.find(crate::toolbar::PNG_LABEL).unwrap().bounds();
+        let tabs = ui.find("Response").unwrap().bounds();
+        let units = ui.find("Units").unwrap().bounds();
+        let smoothing = ui.find("Smoothing").unwrap().bounds();
+        let on_tabs = (button.center_y() - tabs.center_y()).abs() < 2.0;
+        assert_eq!(on_tabs, on_tabs_line, "at {width}: {button:?}");
+        if !on_tabs_line {
+            // On the line the Units group ends, not on one of its own.
+            assert!((button.center_y() - units.center_y()).abs() < 4.0);
+        }
+        starts.push(smoothing.y);
+        drop(ui);
+    }
+    // The controls start at the same height either way.
+    assert!((starts[0] - starts[1]).abs() < 0.5, "{starts:?}");
+}
+
+// Bugs caught: 1, False positives: 0
+#[test]
+fn export_png_writes_the_view_under_the_set_name() {
+    use crate::export_png::{Event, Field};
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("new").join("exports");
+    let mut app = plain(None);
+    app.prefs.exports_dir = Some(out.clone());
+    app.prefs.ask_export = false;
+    heard(&mut app, 0.0, false);
+    app.set_name = "HD600".into();
+    run(&mut app, Message::Png(Event::Open));
+    let options = app.png.clone().unwrap();
+    assert_eq!(
+        (options.width.as_str(), options.height.as_str()),
+        ("1920", "1080")
+    );
+    assert!(options.legend);
+    for (field, value) in [(Field::Width, "640"), (Field::Height, "360")] {
+        run(&mut app, Message::Png(Event::Input(field, value.into())));
+    }
+    run(&mut app, Message::Png(Event::Export));
+    assert!(app.png.is_none());
+    let file = out.join("HD600 - Response.png");
+    assert!(file.is_file(), "{}", app.status.text);
+    assert!(
+        app.status.text.contains("HD600 - Response.png"),
+        "{}",
+        app.status.text
+    );
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&file).unwrap()));
+    let info = decoder.read_info().unwrap();
+    assert_eq!((info.info().width, info.info().height), (640, 360));
+    // Without a set name: the view's name alone.
+    app.set_name = String::new();
+    run(&mut app, Message::GraphViewSelected(graph::View::Phase));
+    run(&mut app, Message::Png(Event::Open));
+    run(&mut app, Message::Png(Event::Preset(1280, 720)));
+    run(&mut app, Message::Png(Event::Export));
+    assert!(out.join("Phase.png").is_file(), "{}", app.status.text);
+}
+
+// Bugs caught: 0, False positives: 0
+#[test]
+fn an_invalid_png_option_keeps_the_panel_open() {
+    use crate::export_png::{Event, Field};
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = plain(None);
+    app.prefs.exports_dir = Some(dir.path().to_path_buf());
+    app.prefs.ask_export = false;
+    run(&mut app, Message::Png(Event::Open));
+    run(
+        &mut app,
+        Message::Png(Event::Input(Field::Width, "100".into())),
+    );
+    run(&mut app, Message::Png(Event::Export));
+    assert!(app.png.is_some());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    run(&mut app, Message::Png(Event::Cancel));
+    assert!(app.png.is_none());
+}
+
+// Not a check: an artifact generator. It exports the Response view of three
+// measurements with the legend at 1920 × 1080 in each appearance to
+// `$FASTGRAPH_PNG_EXPORTS` (`cargo test -p fastgraph -- --ignored
+// render_png_exports`), and snapshots the window with the panel open, for a
+// person to look at.
+// Bugs caught: 0, False positives: 0
+#[test]
+#[ignore]
+fn render_png_exports() {
+    use crate::export_png::Event;
+    let out = PathBuf::from(std::env::var_os("FASTGRAPH_PNG_EXPORTS").expect("an output folder"));
+    let mut app = plain(None);
+    app.prefs.exports_dir = Some(out.clone());
+    app.prefs.ask_export = false;
+    app.capture_rate = Some(48_000);
+    // Heard as Listen hears them.
+    app.state = Activity::Listening;
+    for (side, offset, wobble) in [
+        (Side::L, 0.0, 0.0),
+        (Side::L, -1.5, 0.6),
+        (Side::R, 1.0, -0.8),
+    ] {
+        run(&mut app, Message::SidePicked(side));
+        run(
+            &mut app,
+            Message::Session(SessionEvent::Measured {
+                response: headphone(offset, wobble),
+                ir: ImpulseResponse {
+                    rate: 48_000,
+                    samples: vec![0.0, 1.0],
+                    peak: 1,
+                },
+                sweep_seconds: 6.0,
+                drift_ppm: 38.0,
+                clipped: false,
+            }),
+        );
+    }
+    app.state = Activity::Idle;
+    app.set_name = "Example".into();
+    run(&mut app, Message::Png(Event::Open));
+    snapshot(&app, "png-panel");
+    for mode in [ThemeMode::Dark, ThemeMode::Light] {
+        run(&mut app, Message::ThemePicked(mode));
+        run(&mut app, Message::Png(Event::Open));
+        run(&mut app, Message::Png(Event::Export));
+        let file = out.join("Example - Response.png");
+        assert!(file.is_file(), "{}", app.status.text);
+        std::fs::rename(
+            &file,
+            out.join(format!("Example - Response - {mode:?}.png")),
+        )
+        .unwrap();
+    }
 }

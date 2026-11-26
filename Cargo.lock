@@ -682,6 +682,7 @@ dependencies = [
  "iced",
  "iced_runtime",
  "iced_test",
+ "png",
  "rfd",
  "tempfile",
 ]
