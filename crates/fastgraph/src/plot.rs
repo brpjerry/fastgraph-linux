@@ -54,11 +54,22 @@ impl PlotBox {
         }
     }
 
-    /// The plot showing the decades `low..high` (log10 Hz) across it.
+    /// The plot showing the decades `low..high` (log10 Hz) across it. An
+    /// edge on 20 Hz or 20 kHz is exactly that, through the rounding of
+    /// the powers.
     pub fn with_decades(self, low: f64, high: f64) -> Self {
+        let hz = |decades: f64| {
+            if decades <= F_MIN.log10() {
+                F_MIN
+            } else if decades >= F_MAX.log10() {
+                F_MAX
+            } else {
+                10f64.powf(decades).clamp(F_MIN, F_MAX)
+            }
+        };
         Self {
-            f_low: 10f64.powf(low),
-            f_high: 10f64.powf(high),
+            f_low: hz(low),
+            f_high: hz(high),
             ..self
         }
     }
@@ -81,9 +92,12 @@ impl PlotBox {
         self.left + (t as f32) * self.width
     }
 
-    /// Clamped to the frequencies in view.
+    /// Clamped to the frequencies in view; on an edge, exactly its frequency.
     pub fn freq_at(&self, x: f32) -> f64 {
         let t = (f64::from((x - self.left) / self.width)).clamp(0.0, 1.0);
+        if t == 1.0 {
+            return self.f_high;
+        }
         self.f_low * (self.f_high / self.f_low).powf(t)
     }
 
@@ -111,8 +125,8 @@ pub fn top_db(max: Option<f64>) -> f64 {
 /// How prominent a frequency grid line is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tick {
-    /// A tenth of a decade between two multiples: 1.1, 1.2, … 9.9 times
-    /// a power of ten, drawn on a zoomed axis with room for them.
+    /// A fractional multiple such as 1.1, 1.2 or 9.9 times a power of ten,
+    /// drawn on a zoomed axis with room for them.
     Fine,
     /// A 3, 4, 6, 7, 8 or 9 multiple.
     Minor,
@@ -138,6 +152,8 @@ const FINE_GAP: f64 = 24.0;
 /// The lines of a frequency axis from `low` to `high` Hz, `width` pixels
 /// wide: every 1..9 multiple of a power of ten in view, and between two
 /// multiples m and m + 1 their tenths, where those stand [`FINE_GAP`] apart.
+/// A stretch with none of those gets the tenth nearest its logarithmic
+/// middle, which a third of an octave keeps in view.
 pub fn freq_grid(low: f64, high: f64, width: f32) -> Vec<FreqLine> {
     let px_per_decade = f64::from(width) / (high / low).log10();
     let mut out = Vec::new();
@@ -152,17 +168,32 @@ pub fn freq_grid(low: f64, high: f64, width: f32) -> Vec<FreqLine> {
                 if !(low * (1.0 - 1e-9)..=high * (1.0 + 1e-9)).contains(&freq) {
                     continue;
                 }
-                let tick = match (tenths % 10, m) {
-                    (0, 1) => Tick::Decade,
-                    (0, 2 | 5) => Tick::Major,
-                    (0, _) => Tick::Minor,
-                    _ => Tick::Fine,
-                };
+                let tick = tick_of(tenths);
                 out.push(FreqLine { freq, tick, tenths });
             }
         }
     }
+    if out.is_empty() {
+        let middle = (low * high).sqrt();
+        let tenth = 10f64.powi(middle.log10().floor() as i32) / 10.0;
+        let tenths = (middle / tenth).round() as u32;
+        out.push(FreqLine {
+            freq: f64::from(tenths) * tenth,
+            tick: tick_of(tenths),
+            tenths,
+        });
+    }
     out
+}
+
+/// How prominent the line at `tenths` tenths of a power of ten is.
+fn tick_of(tenths: u32) -> Tick {
+    match (tenths % 10, tenths / 10) {
+        (0, 1) => Tick::Decade,
+        (0, 2 | 5) => Tick::Major,
+        (0, _) => Tick::Minor,
+        _ => Tick::Fine,
+    }
 }
 
 /// The order frequency lines are labelled in: 1, 2 and 5 times a power
@@ -452,5 +483,54 @@ mod tests {
         // A line on the edge survives the rounding of a zoom.
         let edge = 10f64.powf(F_MIN.log10());
         assert_eq!(freq_grid(edge, 30.0, 900.0)[0].freq, 20.0);
+    }
+    // A narrow stretch between two multiples, too tight for its tenths,
+    // still gets one line: the tenth nearest its middle.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_narrow_zoom_keeps_one_frequency_line() {
+        let (low, high) = (1100.0, 1850.0);
+        let grid = freq_grid(low, high, 200.0);
+        assert_eq!(grid.len(), 1, "{grid:?}");
+        assert_eq!((grid[0].freq, grid[0].tenths), (1400.0, 14));
+        assert_eq!(labelled(low, high, 200.0), [14]);
+        // At every place a third of an octave can be, the line is in view.
+        let third = 2f64.powf(1.0 / 3.0);
+        for k in 0..300 {
+            let low = F_MIN * (F_MAX / F_MIN / third).powf(f64::from(k) / 299.0);
+            let grid = freq_grid(low, low * third, 60.0);
+            assert!(!grid.is_empty(), "{low}");
+            let inside = low * (1.0 - 1e-9)..=low * third * (1.0 + 1e-9);
+            assert!(grid.iter().all(|l| inside.contains(&l.freq)), "{low}");
+        }
+    }
+
+    // The edges of the full range read exactly 20 Hz and 20 kHz however
+    // the axis was zoomed, so a trace ending at 20 kHz is read there.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn the_global_edges_stay_exact_on_a_zoomed_axis() {
+        let p = plot();
+        let (lo, hi) = (F_MIN.log10(), F_MAX.log10());
+        for low in [lo, 2.0, 3.5, 4.2] {
+            let z = p.with_decades(low, hi);
+            assert_eq!(z.f_high, F_MAX, "{low}");
+            assert_eq!(z.freq_at(z.right()), F_MAX, "{low}");
+        }
+        for high in [hi, 3.0, 1.6] {
+            let z = p.with_decades(lo, high);
+            assert_eq!(z.f_low, F_MIN, "{high}");
+            assert_eq!(z.freq_at(z.left), F_MIN, "{high}");
+        }
+        // Zoomed in at the right edge, in steps.
+        let limits = crate::zoom::Limits::frequency();
+        let mut range = limits.default;
+        for lines in [1.0, 2.5, 0.7, 4.0] {
+            range = crate::zoom::zoom(range, hi, crate::zoom::factor(lines), &limits).unwrap();
+            let z = p.with_decades(range.low, range.high);
+            assert!(z.f_high <= F_MAX, "{range:?}");
+            let edge = z.freq_at(z.right());
+            assert!(edge <= F_MAX && edge / F_MAX > 1.0 - 1e-12, "{edge}");
+        }
     }
 }

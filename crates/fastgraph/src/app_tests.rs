@@ -1408,6 +1408,56 @@ fn render_snapshots() {
         run(&mut app, Message::GraphViewSelected(graph::View::Phase));
         snapshot(&app, name);
     }
+    // Zoomed: Reset view above the plot, clear of a readout near its right
+    // edge.
+    let plot = crate::plot::PlotBox::inside(1000.0, 600.0, graph::INSETS);
+    let wheel = |axis, at, lines| {
+        Message::Graph(graph::Event::Wheel(graph::Wheel {
+            axis,
+            plot,
+            at,
+            lines,
+        }))
+    };
+    let hover = |freq, db| Message::Graph(graph::Event::Hover(graph::Hover::At { freq, db }));
+    run(
+        &mut app,
+        wheel(graph::Axis::Frequency, plot.right() - 100.0, 4.0),
+    );
+    run(&mut app, wheel(graph::Axis::Level, plot.top + 100.0, 2.0));
+    run(&mut app, hover(12_000.0, 150.0));
+    snapshot(&app, "phase-zoomed");
+    // Distortion in %: at its default fit (every label whole), zoomed in
+    // with a readout near the right edge, and zoomed fully out in a short
+    // window.
+    let first = id(&app, 0);
+    app.distortion.insert(first.clone(), distortion_at(-60.0));
+    if app.selected.as_deref() != Some(first.as_str()) {
+        run(&mut app, Message::Select(first));
+    }
+    run(
+        &mut app,
+        Message::GraphViewSelected(graph::View::Distortion),
+    );
+    run(&mut app, hover(1000.0, -1.0));
+    snapshot(&app, "distortion-pct");
+    run(
+        &mut app,
+        wheel(graph::Axis::Frequency, plot.right() - 50.0, 3.0),
+    );
+    run(&mut app, wheel(graph::Axis::Level, plot.top + 300.0, 3.0));
+    run(&mut app, hover(15_000.0, 0.5));
+    snapshot(&app, "distortion-pct-zoomed");
+    run(&mut app, wheel(graph::Axis::Level, plot.top + 300.0, -60.0));
+    run(
+        &mut app,
+        Message::Graph(graph::Event::Hover(graph::Hover::Left)),
+    );
+    snapshot(&app, "distortion-pct-zoomed-out");
+    snapshot_sized(&app, "distortion-pct-zoomed-out-short", (900.0, 400.0));
+    run(&mut app, Message::Graph(graph::Event::Reset));
+    run(&mut app, Message::GraphViewSelected(graph::View::Phase));
+    run(&mut app, Message::Graph(graph::Event::Reset));
     run(&mut app, Message::GraphViewSelected(graph::View::Response));
 
     run(&mut app, Message::Listen(false));
@@ -3726,4 +3776,35 @@ fn clear_resets_every_views_zoom() {
     run(&mut app, Message::Clear);
     assert!(!app.graph.any_zoomed());
     assert!(app.is_pristine());
+}
+
+// Reset view sits in the margin above the plot, at the plot's right end, so
+// it covers neither the plot nor a readout card in it. Its row is the UI
+// font's line height at the small size, the same for the fallback face.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn reset_view_sits_in_the_margin_above_the_plot() {
+    let mut app = plain(None);
+    let curve = Ok(vec![(PathBuf::from("/in/a.txt"), flat(80.0))]);
+    let clears = app.clears;
+    run(&mut app, Message::Imported(clears, curve));
+    let size = (1000.0, 600.0);
+    let plot = crate::plot::PlotBox::inside(size.0, size.1, graph::INSETS);
+    let wheel = graph::Wheel {
+        axis: graph::Axis::Level,
+        plot,
+        at: plot.top + 20.0,
+        lines: 2.0,
+    };
+    run(&mut app, Message::Graph(graph::Event::Wheel(wheel)));
+    let view = app.graph.view(None, false).map(Message::Graph);
+    let mut ui = crate::testing::ui(size, view);
+    let label = ui.find("Reset view").expect("Reset view offered").bounds();
+    assert!(label.y >= 0.0, "{label:?}");
+    assert!(label.y + label.height <= plot.top, "{label:?}");
+    // Its button's right edge, past 8 px of padding, is the plot's.
+    assert!(
+        (label.x + label.width + 8.0 - plot.right()).abs() < 1.0,
+        "{label:?}"
+    );
 }

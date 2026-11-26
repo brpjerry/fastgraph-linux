@@ -39,14 +39,19 @@ impl Range {
             let centre = within.centre();
             return Range::new(centre - half, centre + half);
         }
-        let shift = if self.low < within.low {
-            within.low - self.low
+        // Moved onto an edge, it ends exactly there.
+        if self.low < within.low {
+            Range::new(within.low, within.low + self.span())
         } else if self.high > within.high {
-            within.high - self.high
+            Range::new(within.high - self.span(), within.high)
         } else {
-            0.0
-        };
-        Range::new(self.low + shift, self.high + shift)
+            self
+        }
+    }
+
+    /// Whether the span is finite and positive: a range an axis can show.
+    fn usable(self) -> bool {
+        self.span().is_finite() && self.span() > 0.0
     }
 
     /// Whether `self` is `other` to within a billionth of its span.
@@ -102,8 +107,12 @@ pub fn factor(lines: f64) -> f64 {
 /// `at`, which keeps its place on the axis, within `limits`: the span stays
 /// between the least and the full one, and the range inside the full one.
 /// `None` when that is the default, so an axis zoomed back out is no longer
-/// zoomed.
+/// zoomed, and when `range` or the result has no finite positive span (its
+/// ends too large to tell apart).
 pub fn zoom(range: Range, at: f64, factor: f64, limits: &Limits) -> Option<Range> {
+    if !range.usable() {
+        return None;
+    }
     let at = at.clamp(range.low, range.high);
     let span = (range.span() * factor)
         .max(limits.min_span)
@@ -111,7 +120,7 @@ pub fn zoom(range: Range, at: f64, factor: f64, limits: &Limits) -> Option<Range
     let k = span / range.span();
     let low = at - (at - range.low) * k;
     let zoomed = Range::new(low, low + span).kept_in(limits.full);
-    (!zoomed.is(limits.default)).then_some(zoomed)
+    (zoomed.usable() && !zoomed.is(limits.default)).then_some(zoomed)
 }
 
 /// A view's zoom: each axis's range, `None` at its default fit.
@@ -226,6 +235,27 @@ mod tests {
             back = zoom(back.unwrap_or(limits.default), -20.0, factor(-0.3), &limits);
         }
         assert_eq!(back, None);
+    }
+
+    // A range with no finite positive span, given or computed, is declined:
+    // it would otherwise be saved and drawn.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_zoom_without_a_usable_span_is_declined() {
+        let limits = Limits::level(Range::new(40.0, 90.0), 5.0);
+        for range in [
+            Range::new(1e300, 1e300),
+            Range::new(-f64::MAX, f64::MAX),
+            Range::new(f64::NAN, 1.0),
+        ] {
+            assert_eq!(zoom(range, 1.0, factor(1.0), &limits), None, "{range:?}");
+        }
+        // Its fit itself has no span: the endpoints round together.
+        let flat = Limits::level(Range::new(1e300, 1e300), 5.0);
+        assert_eq!(zoom(flat.default, 1e300, factor(1.0), &flat), None);
+        // A usable range whose zoomed endpoints round together at its level.
+        let far = Limits::level(Range::new(1e20, 1e20 + 1e6), 5.0);
+        assert_eq!(zoom(far.default, 1e20, factor(50.0), &far), None);
     }
 
     // Bugs caught: 0, False positives: 0
