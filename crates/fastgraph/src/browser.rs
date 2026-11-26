@@ -24,10 +24,10 @@ const PANES: [(Pane, &str); 3] = [
     (Pane::Settings, "Settings"),
 ];
 
-/// A header's `saved` seconds as local date and time, in the locale's date
-/// format and without seconds.
+/// A header's `saved` seconds as local date and time, in the locale's
+/// date and time format.
 pub fn saved_label(secs: u64) -> String {
-    local_time_string(UNIX_EPOCH + Duration::from_secs(secs), false)
+    local_time_string(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 fn count_label(count: usize) -> String {

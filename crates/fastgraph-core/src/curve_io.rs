@@ -95,10 +95,7 @@ pub fn write_rew(resp: &Response, header: &ExportHeader) -> String {
     if header.offset_db != 0.0 {
         out.push_str(&format!("* Offset: {:+.1} dB\n", header.offset_db));
     }
-    out.push_str(&format!(
-        "* Dated: {}\n",
-        local_time_string(header.created, true)
-    ));
+    out.push_str(&format!("* Dated: {}\n", local_time_string(header.created)));
     out.push_str("*\n");
     out.push_str(if phase.is_some() {
         "* Freq(Hz) SPL(dB) Phase(degrees)\n"
@@ -118,27 +115,23 @@ pub fn write_rew(resp: &Response, header: &ExportHeader) -> String {
     out
 }
 
-/// `t` in the local time zone: the locale's date (`%x`) and a time of day,
-/// the locale's own (`%X`, seconds included) when `with_seconds` is set and
-/// `%H:%M` otherwise. The locale comes from `LC_TIME` once the program has
-/// called `setlocale(LC_TIME, "")`; before that it is the "C" locale.
-pub fn local_time_string(t: SystemTime, with_seconds: bool) -> String {
+/// `t` in the local time zone, as the locale's date and time of day (`%x %X`;
+/// under en_US, `11/14/2023 10:13:20 PM`). The locale comes from `LC_TIME`
+/// once the program has called `setlocale(LC_TIME, "")`; before that it is
+/// the "C" locale.
+pub fn local_time_string(t: SystemTime) -> String {
     let secs = match t.duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs() as i64,
         Err(e) => -(e.duration().as_secs() as i64),
     };
-    let format: &[u8] = if with_seconds {
-        b"%x %X\0"
-    } else {
-        b"%x %H:%M\0"
-    };
+    let format: &[u8] = b"%x %X\0";
     let time = secs as libc::time_t;
     // SAFETY: `tm` is plain data that `localtime_r` fills in, and `buf` is
     // large enough for `strftime`, which reports how many bytes it wrote.
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&time, &mut tm).is_null() {
-            return utc_string(t);
+            return "unknown time".to_owned();
         }
         let mut buf = [0u8; 128];
         let n = libc::strftime(
@@ -287,7 +280,7 @@ mod tests {
             assert!(text.starts_with("* fastgraph export\n"));
             assert!(text.contains("* Smoothing: 1/12"));
             assert!(text.contains("* Compensation: Coupler"));
-            let dated = format!("* Dated: {}\n", local_time_string(header().created, true));
+            let dated = format!("* Dated: {}\n", local_time_string(header().created));
             assert!(text.contains(&dated));
             let back = read_curve(&text).unwrap();
             assert_eq!(back.freq.len(), r.freq.len());
@@ -344,12 +337,12 @@ mod tests {
         // TZ is process-wide, so each zone is checked in its own process.
         if let Ok(zone) = std::env::var("FASTGRAPH_TZ_CHILD") {
             let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-            let (full, short) = match zone.as_str() {
-                "UTC0" => ("11/14/23 22:13:20", "11/14/23 22:13"),
-                _ => ("11/14/23 17:13:20", "11/14/23 17:13"),
+            // The "C" locale's `%x %X`; the zone shifts the hour.
+            let expected = match zone.as_str() {
+                "UTC0" => "11/14/23 22:13:20",
+                _ => "11/14/23 17:13:20",
             };
-            assert_eq!(local_time_string(t, true), full);
-            assert_eq!(local_time_string(t, false), short);
+            assert_eq!(local_time_string(t), expected);
             return;
         }
         for zone in ["UTC0", "EST5"] {
