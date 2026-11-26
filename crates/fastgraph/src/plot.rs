@@ -34,6 +34,9 @@ pub struct PlotBox {
     pub height: f32,
     /// The dB between the top and bottom edges.
     pub span: f64,
+    /// The frequencies on the left and right edges, in Hz.
+    pub f_low: f64,
+    pub f_high: f64,
 }
 
 impl PlotBox {
@@ -46,6 +49,17 @@ impl PlotBox {
             width,
             height,
             span: DB_PER_WIDTH * f64::from(height / width),
+            f_low: F_MIN,
+            f_high: F_MAX,
+        }
+    }
+
+    /// The plot showing the decades `low..high` (log10 Hz) across it.
+    pub fn with_decades(self, low: f64, high: f64) -> Self {
+        Self {
+            f_low: 10f64.powf(low),
+            f_high: 10f64.powf(high),
+            ..self
         }
     }
 
@@ -63,14 +77,14 @@ impl PlotBox {
     }
 
     pub fn x_of(&self, freq: f64) -> f32 {
-        let t = (freq.max(1e-9) / F_MIN).log10() / (F_MAX / F_MIN).log10();
+        let t = (freq.max(1e-9) / self.f_low).log10() / (self.f_high / self.f_low).log10();
         self.left + (t as f32) * self.width
     }
 
-    /// Clamped to the plotted decades.
+    /// Clamped to the frequencies in view.
     pub fn freq_at(&self, x: f32) -> f64 {
         let t = (f64::from((x - self.left) / self.width)).clamp(0.0, 1.0);
-        F_MIN * (F_MAX / F_MIN).powf(t)
+        self.f_low * (self.f_high / self.f_low).powf(t)
     }
 
     /// `top_db` sits on the top edge, `top_db - span` on the bottom one.
@@ -97,6 +111,9 @@ pub fn top_db(max: Option<f64>) -> f64 {
 /// How prominent a frequency grid line is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tick {
+    /// A tenth of a decade between two multiples: 1.1, 1.2, … 9.9 times
+    /// a power of ten, drawn on a zoomed axis with room for them.
+    Fine,
     /// A 3, 4, 6, 7, 8 or 9 multiple.
     Minor,
     /// A 2 or 5 multiple.
@@ -105,63 +122,100 @@ pub enum Tick {
     Decade,
 }
 
-/// Every 1..9 multiple per decade in view, with its prominence.
-pub fn freq_grid() -> Vec<(f64, Tick)> {
+/// A frequency grid line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FreqLine {
+    pub freq: f64,
+    pub tick: Tick,
+    /// Its tenths of the power of ten below it: 10 for 100 Hz, 25 for 250 Hz.
+    pub tenths: u32,
+}
+
+/// The least room between the fine lines of a stretch, in pixels: they
+/// show only on an axis zoomed well in.
+const FINE_GAP: f64 = 24.0;
+
+/// The lines of a frequency axis from `low` to `high` Hz, `width` pixels
+/// wide: every 1..9 multiple of a power of ten in view, and between two
+/// multiples m and m + 1 their tenths, where those stand [`FINE_GAP`] apart.
+pub fn freq_grid(low: f64, high: f64, width: f32) -> Vec<FreqLine> {
+    let px_per_decade = f64::from(width) / (high / low).log10();
     let mut out = Vec::new();
-    for decade in [10.0, 100.0, 1000.0, 10_000.0] {
-        for m in 1..=9 {
-            let f = decade * f64::from(m);
-            if (F_MIN..=F_MAX).contains(&f) {
-                let tick = match m {
-                    1 => Tick::Decade,
-                    2 | 5 => Tick::Major,
-                    _ => Tick::Minor,
+    for exp in low.log10().floor() as i32..=high.log10().floor() as i32 {
+        let tenth = 10f64.powi(exp) / 10.0;
+        for m in 1..=9u32 {
+            let fine = f64::from(10 * m + 10) / f64::from(10 * m + 9);
+            let fine = fine.log10() * px_per_decade >= FINE_GAP;
+            for tenths in 10 * m..10 * m + if fine { 10 } else { 1 } {
+                let freq = f64::from(tenths) * tenth;
+                // A line on an edge stays, through the rounding of a zoom.
+                if !(low * (1.0 - 1e-9)..=high * (1.0 + 1e-9)).contains(&freq) {
+                    continue;
+                }
+                let tick = match (tenths % 10, m) {
+                    (0, 1) => Tick::Decade,
+                    (0, 2 | 5) => Tick::Major,
+                    (0, _) => Tick::Minor,
+                    _ => Tick::Fine,
                 };
-                out.push((f, tick));
+                out.push(FreqLine { freq, tick, tenths });
             }
         }
     }
     out
 }
 
-/// The 1..9 multiple of a power of ten that `f` is: 3 for 300 Hz.
-pub fn multiple(f: f64) -> u32 {
-    (f / 10f64.powf(f.log10().floor())).round() as u32
+/// The order frequency lines are labelled in: 1, 2 and 5 times a power
+/// of ten, then 3, 7, 4, 6, 8 and 9, then the halves between (1.5, 2.5,
+/// …), then the other tenths. Each leaves more room than the next.
+fn label_tier(tenths: u32) -> usize {
+    match tenths {
+        10 | 20 | 50 => 0,
+        30 => 1,
+        70 => 2,
+        40 => 3,
+        60 => 4,
+        80 => 5,
+        90 => 6,
+        t if t % 10 == 5 => 7,
+        _ => 8,
+    }
 }
 
 /// The advance of the mono face, as a share of its size.
 const MONO_ADVANCE: f32 = 0.62;
 /// The least room between two labels side by side, in pixels.
 const LABEL_PAD: f32 = 6.0;
-/// The multiples labelled beyond 1, 2 and 5, in the order they are added:
-/// each leaves more room than the next.
-const EXTRA_LABELS: [u32; 6] = [3, 7, 4, 6, 8, 9];
 
-/// The multiples whose lines a frequency axis `width` pixels wide labels,
-/// in labels `size` pixels tall: 1, 2 and 5, then 3, 7, 4, 6, 8 and 9 in
-/// turn while every label keeps room from its neighbours.
-pub fn freq_label_multiples(width: f32, size: f32) -> Vec<u32> {
-    let mut labelled = vec![1, 2, 5];
-    for extra in EXTRA_LABELS {
-        labelled.push(extra);
-        if !labels_fit(&labelled, width, size) {
-            labelled.pop();
-            break;
-        }
-    }
-    labelled
+/// Which of `lines`, on an axis from `low` to `high` Hz `width` pixels
+/// wide, carry a label `size` pixels tall: the tiers of [`label_tier`] in
+/// turn while every label keeps room from its neighbours. 1, 2 and 5 times
+/// a power of ten are always labelled.
+pub fn freq_labelled(lines: &[FreqLine], low: f64, high: f64, width: f32, size: f32) -> Vec<bool> {
+    let tiers = (1..=8)
+        .take_while(|&n| labels_fit(lines, n + 1, low, high, width, size))
+        .last()
+        .map_or(1, |n| n + 1);
+    lines.iter().map(|l| label_tier(l.tenths) < tiers).collect()
 }
 
-/// Whether the labels of the `multiples` lines on an axis `width` pixels
-/// wide stand apart.
-fn labels_fit(multiples: &[u32], width: f32, size: f32) -> bool {
-    let decades = (F_MAX / F_MIN).log10();
-    let placed: Vec<(f32, f32)> = freq_grid()
-        .into_iter()
-        .filter(|(f, _)| multiples.contains(&multiple(*f)))
-        .map(|(f, _)| {
-            let x = ((f / F_MIN).log10() / decades) as f32 * width;
-            let w = freq_tick(f).chars().count() as f32 * MONO_ADVANCE * size;
+/// Whether the labels of the `lines` in the first `tiers` label tiers
+/// stand apart.
+fn labels_fit(
+    lines: &[FreqLine],
+    tiers: usize,
+    low: f64,
+    high: f64,
+    width: f32,
+    size: f32,
+) -> bool {
+    let decades = (high / low).log10();
+    let placed: Vec<(f32, f32)> = lines
+        .iter()
+        .filter(|l| label_tier(l.tenths) < tiers)
+        .map(|l| {
+            let x = ((l.freq / low).log10() / decades) as f32 * width;
+            let w = freq_tick(l.freq).chars().count() as f32 * MONO_ADVANCE * size;
             (x, w)
         })
         .collect();
@@ -303,31 +357,54 @@ mod tests {
         }
     }
 
+    /// The labelled lines' multiples (in tenths) on an axis from `low` to
+    /// `high` Hz, `width` pixels wide, in 11 px labels.
+    fn labelled(low: f64, high: f64, width: f32) -> Vec<u32> {
+        let lines = freq_grid(low, high, width);
+        let labelled = freq_labelled(&lines, low, high, width, 11.0);
+        let mut tenths: Vec<u32> = lines
+            .iter()
+            .zip(labelled)
+            .filter(|(_, l)| *l)
+            .map(|(l, _)| l.tenths)
+            .collect();
+        tenths.sort_unstable();
+        tenths.dedup();
+        tenths
+    }
+
     // Bugs caught: 0, False positives: 0
     #[test]
     fn a_wide_axis_labels_the_minor_lines_too() {
-        assert_eq!(multiple(300.0), 3);
-        assert_eq!(multiple(20_000.0), 2);
-        assert_eq!(multiple(7000.0), 7);
-        let all = freq_label_multiples(3000.0, 11.0);
-        assert_eq!(all, [1, 2, 5, 3, 7, 4, 6, 8, 9]);
+        assert_eq!(
+            labelled(F_MIN, F_MAX, 3000.0),
+            [10, 20, 30, 40, 50, 60, 70, 80, 90]
+        );
         // A typical plot labels what fits: 6 would crowd 7.
-        assert_eq!(freq_label_multiples(1000.0, 11.0), [1, 2, 5, 3, 7, 4]);
+        assert_eq!(labelled(F_MIN, F_MAX, 1000.0), [10, 20, 30, 40, 50, 70]);
         // A small plot keeps 1, 2 and 5 only.
-        assert_eq!(freq_label_multiples(300.0, 11.0), [1, 2, 5]);
+        assert_eq!(labelled(F_MIN, F_MAX, 300.0), [10, 20, 50]);
         for width in [300.0, 1000.0, 3000.0] {
-            assert!(labels_fit(&freq_label_multiples(width, 11.0), width, 11.0));
+            let lines = freq_grid(F_MIN, F_MAX, width);
+            let tiers = lines
+                .iter()
+                .zip(freq_labelled(&lines, F_MIN, F_MAX, width, 11.0))
+                .filter(|(_, l)| *l)
+                .map(|(l, _)| label_tier(l.tenths))
+                .max()
+                .unwrap();
+            assert!(labels_fit(&lines, tiers + 1, F_MIN, F_MAX, width, 11.0));
         }
     }
 
     // Bugs caught: 0, False positives: 0
     #[test]
     fn frequency_grid_marks_decades_and_one_two_five_lines() {
-        let grid = freq_grid();
+        let grid = freq_grid(F_MIN, F_MAX, 1000.0);
         let at = |tick| {
             grid.iter()
-                .filter(|(_, t)| *t >= tick)
-                .map(|(f, _)| *f)
+                .filter(|l| l.tick >= tick)
+                .map(|l| l.freq)
                 .collect::<Vec<_>>()
         };
         assert_eq!(at(Tick::Decade), [100.0, 1000.0, 10_000.0]);
@@ -337,8 +414,43 @@ mod tests {
                 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0, 20_000.0
             ]
         );
+        // No fine lines at the full range, even on a wide plot.
         assert_eq!(grid.len(), 28);
+        assert_eq!(freq_grid(F_MIN, F_MAX, 2400.0).len(), 28);
         assert_eq!(freq_tick(10_000.0), "10k");
         assert_eq!(freq_label(1234.0), "1.23 kHz");
+    }
+
+    // A zoomed axis has lines and labels in view only, the tenths between
+    // multiples where there is room, and labels that stand apart.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_zoomed_frequency_axis_has_lines_in_view_only() {
+        // A third of an octave from 1 kHz: tenths of the kHz.
+        let (low, high) = (1000.0, 1000.0 * 2f64.powf(1.0 / 3.0));
+        let grid = freq_grid(low, high, 900.0);
+        let freqs: Vec<f64> = grid.iter().map(|l| l.freq).collect();
+        assert_eq!(freqs, [1000.0, 1100.0, 1200.0]);
+        assert_eq!(grid[1].tick, Tick::Fine);
+        assert_eq!(labelled(low, high, 900.0), [10, 11, 12]);
+        assert_eq!(freq_tick(1100.0), "1.1k");
+        // Two octaves at 100 Hz: tenths only where they stand apart, which
+        // is the low multiples first.
+        let grid = freq_grid(100.0, 400.0, 900.0);
+        assert!(grid.iter().all(|l| (100.0..=400.0).contains(&l.freq)));
+        assert!(grid.iter().any(|l| l.freq == 110.0));
+        assert!(!grid.iter().any(|l| l.freq == 390.0));
+        let lines = freq_grid(100.0, 400.0, 900.0);
+        let labelled = freq_labelled(&lines, 100.0, 400.0, 900.0, 11.0);
+        let shown: Vec<FreqLine> = lines
+            .iter()
+            .zip(labelled)
+            .filter(|(_, l)| *l)
+            .map(|(l, _)| *l)
+            .collect();
+        assert!(shown.len() >= 4, "{shown:?}");
+        // A line on the edge survives the rounding of a zoom.
+        let edge = 10f64.powf(F_MIN.log10());
+        assert_eq!(freq_grid(edge, 30.0, 900.0)[0].freq, 20.0);
     }
 }

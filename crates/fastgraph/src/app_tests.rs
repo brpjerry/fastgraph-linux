@@ -1382,10 +1382,10 @@ fn render_snapshots() {
     run(&mut app, Message::Listen(true));
     run(
         &mut app,
-        Message::Graph(graph::Hover::At {
+        Message::Graph(graph::Event::Hover(graph::Hover::At {
             freq: 2900.0,
             db: 88.0,
-        }),
+        })),
     );
     snapshot(&app, "measurements");
 
@@ -3581,7 +3581,7 @@ fn clear_is_offered_whenever_there_is_something_to_reset() {
     assert!(app.is_pristine());
 }
 
-// Bugs caught: 1, False positives: 0
+// Bugs caught: 2, False positives: 0
 #[test]
 fn the_graph_tabs_keep_their_width_while_there_is_room() {
     let app = plain(None);
@@ -3634,4 +3634,96 @@ fn an_import_clicked_before_clear_is_dropped() {
     assert!(app.status.text.is_empty(), "{}", app.status.text);
     run(&mut app, Message::Imported(since, late()));
     assert_eq!(names(&app), ["late"]);
+}
+
+/// The messages a click on Reset view gives; `None` when the window does
+/// not show it.
+fn reset_view_clicked(app: &App) -> Option<Vec<Message>> {
+    let mut ui = crate::testing::ui(crate::testing::SIZE, app.view());
+    ui.click("Reset view").ok()?;
+    Some(ui.messages())
+}
+
+/// The messages a wheel scroll of `lines` notches at `at` over the graph
+/// alone, in a window of `size`, gives.
+fn graph_scrolled(app: &App, size: (f32, f32), at: iced::Point, lines: f32) -> Vec<Message> {
+    let view = app.graph.view(None, false).map(Message::Graph);
+    let mut ui = crate::testing::ui(size, view);
+    ui.point_at(at);
+    ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: lines },
+    })]);
+    ui.messages()
+}
+
+// Bugs caught: 0, False positives: 0
+#[test]
+fn reset_view_is_offered_after_a_zoom_and_restores_the_default() {
+    let mut app = plain(None);
+    let curve = Ok(vec![(PathBuf::from("/in/a.txt"), flat(80.0))]);
+    let clears = app.clears;
+    run(&mut app, Message::Imported(clears, curve));
+    assert_eq!(app.graph.trace_count(), 1);
+    let size = (1000.0, 600.0);
+    let plot = crate::plot::PlotBox::inside(size.0, size.1, graph::INSETS);
+    let shown = |app: &App| app.graph.axis(plot);
+    let default = shown(&app);
+    // Not offered while nothing is zoomed.
+    assert!(reset_view_clicked(&app).is_none());
+    // The wheel over the plot itself does nothing.
+    let middle = iced::Point::new(plot.left + plot.width / 2.0, plot.top + plot.height / 2.0);
+    let wheel = |m: &Message| matches!(m, Message::Graph(graph::Event::Wheel(_)));
+    assert!(!graph_scrolled(&app, size, middle, 2.0).iter().any(wheel));
+    // Over the frequency labels, it zooms frequency.
+    let under = iced::Point::new(middle.x, plot.bottom() + 12.0);
+    let scrolled = graph_scrolled(&app, size, under, 2.0);
+    assert!(scrolled.iter().any(wheel), "{scrolled:?}");
+    for message in scrolled {
+        run(&mut app, message);
+    }
+    let zoomed = shown(&app);
+    assert!(zoomed.0.f_high / zoomed.0.f_low < default.0.f_high / default.0.f_low);
+    assert_eq!((zoomed.0.span, zoomed.1), (default.0.span, default.1));
+    // Over the level labels, it zooms the level axis too.
+    let beside = iced::Point::new(plot.left - 12.0, middle.y);
+    for message in graph_scrolled(&app, size, beside, 1.0) {
+        run(&mut app, message);
+    }
+    assert!(shown(&app).0.span < default.0.span);
+    // Reset view is offered in this view only, and restores the default.
+    run(&mut app, Message::GraphViewSelected(graph::View::Phase));
+    assert!(reset_view_clicked(&app).is_none());
+    run(&mut app, Message::GraphViewSelected(graph::View::Response));
+    let clicked = reset_view_clicked(&app).expect("Reset view offered once zoomed");
+    let reset = |m: &Message| matches!(m, Message::Graph(graph::Event::Reset));
+    assert!(clicked.iter().any(reset), "{clicked:?}");
+    for message in clicked {
+        run(&mut app, message);
+    }
+    assert_eq!(shown(&app), default);
+    assert!(reset_view_clicked(&app).is_none());
+}
+
+// Bugs caught: 0, False positives: 0
+#[test]
+fn clear_resets_every_views_zoom() {
+    let mut app = plain(None);
+    let plot = crate::plot::PlotBox::inside(1000.0, 600.0, graph::INSETS);
+    let wheel = graph::Wheel {
+        axis: graph::Axis::Frequency,
+        plot,
+        at: plot.left + 10.0,
+        lines: 3.0,
+    };
+    // A zoom alone is something for Clear to reset.
+    run(&mut app, Message::Graph(graph::Event::Wheel(wheel)));
+    assert!(!app.is_pristine());
+    run(
+        &mut app,
+        Message::GraphViewSelected(graph::View::Distortion),
+    );
+    run(&mut app, Message::Graph(graph::Event::Wheel(wheel)));
+    run(&mut app, Message::Clear);
+    assert!(!app.graph.any_zoomed());
+    assert!(app.is_pristine());
 }

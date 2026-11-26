@@ -162,6 +162,12 @@ The tabs over the graph switch between three views:
 Hover over the graph to read values at the pointer. The Response view lists every trace's level
 at that frequency, loudest first. The Phase and Distortion views show the nearest trace or curve.
 
+To zoom, scroll over the frequency labels under the graph, or over the level labels to its left.
+The zoom centres on the pointer, from 20 Hz–20 kHz down to a third of an octave, and from twice
+the automatic level range down to 5 dB (10° in Phase, one decade in Distortion %). Each view
+keeps its own zoom. **Reset view**, in the graph's top-right corner while the view is zoomed,
+returns it to the automatic axes. **Clear** resets every view.
+
 ### Clear
 
 **Clear**, under the list, empties the session and returns the app to its first-opened state.
