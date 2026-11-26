@@ -27,8 +27,11 @@ Wayland-native window.
 git clone https://github.com/brpjerry/fastgraph-linux.git && cd fastgraph-linux/packaging/arch && makepkg -si
 ```
 
-This builds and installs the `fastgraph-git` package, with a desktop entry and icon. A prebuilt
-package may also be attached to the GitHub releases.
+This builds and installs the `fastgraph-git` package, with a desktop entry and icon.
+
+Each tagged release also has a prebuilt package on the
+[Releases](https://github.com/brpjerry/fastgraph-linux/releases) page, built by GitHub Actions.
+Install it with `sudo pacman -U fastgraph-git-*.pkg.tar.zst`.
 
 ## Build from source
 

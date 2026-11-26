@@ -41,12 +41,16 @@ prepare() {
 build() {
     cd "$srcdir/fastgraph-linux"
     export CARGO_TARGET_DIR=target
+    # Keep the builder's home and build directories out of the binary.
+    export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$srcdir=/build"
     cargo build --frozen --release --target "$_target" -p fastgraph
 }
 
 check() {
     cd "$srcdir/fastgraph-linux"
     export CARGO_TARGET_DIR=target
+    # Keep the builder's home and build directories out of the binary.
+    export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$srcdir=/build"
     # Core tests use temporary state and synthetic signals; the PipeWire
     # loopback tests are #[ignore]d and stay so (they load a null sink).
     cargo test --frozen --release --target "$_target" -p fastgraph-core

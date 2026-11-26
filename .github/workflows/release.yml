@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  arch-package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build and runtime dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git github-cli rust clang pkgconf python \
+            libpipewire pipewire pipewire-audio wireplumber wayland libxkbcommon \
+            vulkan-icd-loader fontconfig hicolor-icon-theme
+
+      - uses: actions/checkout@v4
+
+      - name: Build the package from the tagged commit
+        run: |
+          useradd -m builder
+          install -d -o builder /build
+          # Pin the PKGBUILD's git source to the commit being released.
+          sed "s|^source=(\"git+\(.*\)\")|source=(\"git+\1#commit=${GITHUB_SHA}\")|" \
+            packaging/arch/PKGBUILD > /build/PKGBUILD
+          grep -q "#commit=${GITHUB_SHA}" /build/PKGBUILD
+          chown builder /build/PKGBUILD
+          cd /build
+          su builder -c 'makepkg -f --noconfirm'
+          cp PKGBUILD PKGBUILD-fastgraph-git
+          sha256sum ./*.pkg.tar.zst PKGBUILD-fastgraph-git > SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd /build
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "fastgraph ${GITHUB_REF_NAME#v}" --generate-notes \
+            ./*.pkg.tar.zst PKGBUILD-fastgraph-git SHA256SUMS
