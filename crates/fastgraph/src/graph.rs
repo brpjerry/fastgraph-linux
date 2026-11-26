@@ -5,17 +5,21 @@
 //! the harmonics, THD and noise floor of one measurement in % or on a dB axis that holds them
 //! all.
 //!
+//! The wheel over an axis's labels zooms that axis, each view on its own
+//! (see [`crate::zoom`]).
+//!
 //! As in fastpeq-gui's graph, the grid and the traces are cached and redrawn
 //! only when what they show ([`Graph::set`]) or the canvas size changes; the
 //! hover crosshair and readout are drawn every frame on their own layer.
 use crate::plot::{self, Insets, PlotBox, Tick};
 use crate::theme::{self, Palette};
+use crate::zoom::{self, Range, ViewZoom};
 use fastgraph_core::response::Response;
 use iced::advanced::mouse::{self, Cursor};
 use iced::alignment::Vertical;
 use iced::widget::canvas::{self, Cache, Frame, Geometry, Path, Stroke, Text};
 use iced::widget::text::Alignment;
-use iced::widget::{Canvas, container, stack, text};
+use iced::widget::{Canvas, Stack, button, container, text};
 use iced::{Element, Length, Point, Rectangle, Renderer, Size, Theme};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -29,7 +33,7 @@ pub const ALL_HIDDEN: &str = "Show a measurement, or use Measure, Listen, or Imp
 const MAX_DB_SPAN: f64 = 160.0;
 
 /// Room for the axis labels.
-const INSETS: Insets = Insets {
+pub(crate) const INSETS: Insets = Insets {
     left: 44.0,
     right: 16.0,
     top: 16.0,
@@ -103,14 +107,10 @@ const PCT_SPAN: f64 = 4.0;
 const THD_WIDTH: f32 = 2.5;
 const LABEL_GAP: f32 = LABEL_SIZE + 2.0;
 
-/// The y of `percent` on the percent axis of `plot`: its decades from
-/// 0.01 % (the bottom edge) to 100 % (the top one), values beyond pinned.
-fn percent_y(plot: &PlotBox, percent: f64) -> f32 {
-    let axis = PlotBox {
-        span: PCT_SPAN,
-        ..*plot
-    };
-    axis.y_of(percent_axis(percent), PCT_TOP)
+/// The y of `percent` on the percent axis `plot` (its span in decades)
+/// topped at the decade `top`, values beyond pinned.
+fn percent_y(plot: &PlotBox, top: f64, percent: f64) -> f32 {
+    plot.y_of(percent_axis(percent), top)
         .clamp(plot.top, plot.bottom())
 }
 
@@ -260,6 +260,43 @@ pub enum Hover {
     },
     Left,
 }
+
+/// What the canvas reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Event {
+    Hover(Hover),
+    /// The wheel turned over an axis's labels.
+    Wheel(Wheel),
+    /// Reset view was pressed: the view back to its automatic axes.
+    Reset,
+}
+
+/// A graph axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    Frequency,
+    /// The vertical one: dB, degrees or percent.
+    Level,
+}
+
+/// A wheel scroll over an axis: it zooms that axis about the pointer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wheel {
+    pub axis: Axis,
+    /// The plot it turned over, before any zoom: the default axes follow
+    /// its shape.
+    pub plot: PlotBox,
+    /// The pointer's place along the axis: x for frequency, y for level.
+    pub at: f32,
+    /// Notches, positive (up) zooming in.
+    pub lines: f64,
+}
+
+/// The least span a level axis zooms in to: 5 dB, 10° or a decade of
+/// percent.
+const MIN_DB_SPAN: f64 = 5.0;
+const MIN_PHASE_SPAN: f64 = 10.0;
+const MIN_PCT_SPAN: f64 = 1.0;
 
 /// One shown measurement: its display response and colour index.
 #[derive(Debug, Clone)]
@@ -515,6 +552,8 @@ pub struct Graph {
     drawn_span: Cell<f64>,
     /// What the Distortion view says when it has no curves.
     distortion_note: String,
+    /// Each view's zoom, by tab index.
+    zooms: [ViewZoom; VIEWS.len()],
     cache: Cache,
     /// The live trace's own layer, cleared on every RTA update.
     live_cache: Cache,
@@ -537,6 +576,7 @@ impl Default for Graph {
             extent: None,
             drawn_span: Cell::new(0.0),
             distortion_note: NO_DISTORTION.to_string(),
+            zooms: Default::default(),
             cache: Cache::new(),
             live_cache: Cache::new(),
             #[cfg(test)]
@@ -606,9 +646,132 @@ impl Graph {
         self.phase.len()
     }
 
-    /// The plot with its vertical axis as this view draws it, and the value
-    /// at its top: dB, or degrees (wrapped ±180° or the unwrapped fit).
-    fn axis(&self, plot: PlotBox) -> (PlotBox, f64) {
+    /// The plot with its axes as this view draws them, zoomed or not, and
+    /// the value at its top: dB, degrees, or the decade of a percentage.
+    pub(crate) fn axis(&self, plot: PlotBox) -> (PlotBox, f64) {
+        let zoom = self.zoom();
+        let plot = match zoom.freq {
+            Some(r) => plot.with_decades(r.low, r.high),
+            None => plot,
+        };
+        let (plot, top) = self.default_axis(plot);
+        match zoom.level {
+            // Within this size's limits, about the saved centre, so a range
+            // saved at another size is drawn as the wheel would leave it.
+            Some(r) => {
+                let span = r
+                    .span()
+                    .max(self.least_level_span(plot.span))
+                    .min(zoom::LEVEL_OUT * plot.span);
+                let top = r.high + (span - r.span()) / 2.0;
+                (PlotBox { span, ..plot }, top)
+            }
+            None => (plot, top),
+        }
+    }
+
+    /// Whether traces beyond the level axis are pinned to its edge, as on
+    /// the automatic fit, rather than cut, as on a zoomed axis.
+    fn pins(&self) -> bool {
+        self.zoom().level.is_none()
+    }
+
+    /// The current view's zoom.
+    fn zoom(&self) -> ViewZoom {
+        self.zooms[index(self.view)]
+    }
+
+    /// Whether the current view is zoomed: Reset view has something to do.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoom().is_zoomed()
+    }
+
+    /// Whether any view is zoomed.
+    pub fn any_zoomed(&self) -> bool {
+        self.zooms.iter().any(ViewZoom::is_zoomed)
+    }
+
+    /// Reset view: the current view's axes back to their automatic fit.
+    pub fn reset_view(&mut self) {
+        self.set_zoom(self.view, ViewZoom::default());
+    }
+
+    /// Every view's axes back to their automatic fit.
+    pub fn reset_zoom(&mut self) {
+        for view in VIEWS.map(|(v, _)| v) {
+            self.set_zoom(view, ViewZoom::default());
+        }
+    }
+
+    /// `view`'s level axis back to its fit, as when its units change.
+    pub fn reset_level(&mut self, view: View) {
+        let zoom = ViewZoom {
+            level: None,
+            ..self.zooms[index(view)]
+        };
+        self.set_zoom(view, zoom);
+    }
+
+    fn set_zoom(&mut self, view: View, zoom: ViewZoom) {
+        let slot = &mut self.zooms[index(view)];
+        if *slot != zoom {
+            *slot = zoom;
+            if view == self.view {
+                self.cache.clear();
+                self.live_cache.clear();
+            }
+        }
+    }
+
+    /// Zoom the axis the wheel turned over, about the value under the
+    /// pointer, from the range drawn. An empty Distortion view has no level
+    /// axis to zoom.
+    pub fn wheel(&mut self, wheel: Wheel) {
+        if wheel.axis == Axis::Level && self.view == View::Distortion && self.distortion.is_none() {
+            return;
+        }
+        let (shown, top) = self.axis(wheel.plot);
+        let factor = zoom::factor(wheel.lines);
+        let mut zoomed = self.zoom();
+        match wheel.axis {
+            Axis::Frequency => {
+                let limits = zoom::Limits::frequency();
+                let range = zoomed.freq.unwrap_or(limits.default);
+                let at = shown.freq_at(wheel.at).log10();
+                zoomed.freq = zoom::zoom(range, at, factor, &limits);
+            }
+            Axis::Level => {
+                let limits = self.level_limits(wheel.plot);
+                let range = Range::new(top - shown.span, top);
+                let at = shown.db_at(wheel.at, top);
+                zoomed.level = zoom::zoom(range, at, factor, &limits);
+            }
+        }
+        self.set_zoom(self.view, zoomed);
+    }
+
+    /// How far the current view's level axis zooms on `plot`.
+    fn level_limits(&self, plot: PlotBox) -> zoom::Limits {
+        let (fit, top) = self.default_axis(plot);
+        let least = self.least_level_span(fit.span);
+        zoom::Limits::level(Range::new(top - fit.span, top), least)
+    }
+
+    /// The least span the current view's level axis zooms in to, for an
+    /// automatic fit of `fit_span`: a tighter fit is itself the least.
+    fn least_level_span(&self, fit_span: f64) -> f64 {
+        let least = match self.view {
+            View::Phase => MIN_PHASE_SPAN,
+            View::Distortion if self.units() == Units::Percent => MIN_PCT_SPAN,
+            View::Response | View::Distortion => MIN_DB_SPAN,
+        };
+        least.min(fit_span)
+    }
+
+    /// The plot with its vertical axis fitted as this view draws it
+    /// unzoomed, and the value at its top: dB, or degrees (wrapped ±180° or
+    /// the unwrapped fit), or the decade of a percentage.
+    fn default_axis(&self, plot: PlotBox) -> (PlotBox, f64) {
         match self.view {
             View::Phase => {
                 let (top, span) = self.phase_axis.range();
@@ -667,7 +830,9 @@ impl Graph {
     pub fn set_live(&mut self, live: Option<Response>) {
         self.live = live;
         self.live_cache.clear();
-        if self.rescale() {
+        // A zoomed level axis stays put.
+        let held = self.view == View::Response && self.zoom().level.is_some();
+        if self.rescale() && !held {
             self.cache.clear();
         }
     }
@@ -718,15 +883,26 @@ impl Graph {
         }
     }
 
-    /// The canvas, with a note over it when there is something to say;
-    /// `rows`: the list has measurements.
-    pub fn view(&self, hover: Option<(f64, f64)>, rows: bool) -> Element<'_, Hover> {
+    /// The canvas, with a note over it when there is something to say and
+    /// Reset view while the view is zoomed; `rows`: the list has
+    /// measurements.
+    pub fn view(&self, hover: Option<(f64, f64)>, rows: bool) -> Element<'_, Event> {
+        let layers = self.layers(hover, rows);
+        let reset = self.is_zoomed().then(reset_button);
+        Stack::with_children(layers).extend(reset).into()
+    }
+
+    /// The canvas and the notes over it.
+    fn layers(&self, hover: Option<(f64, f64)>, rows: bool) -> Vec<Element<'_, Event>> {
         let canvas = Canvas::new(Plot { graph: self, hover })
             .width(Length::Fill)
             .height(Length::Fill);
         if let (View::Distortion, Some(d)) = (self.view, &self.distortion) {
             // Which measurement it is.
-            return stack![canvas, corner_caption(format!("Distortion: {}", d.name))].into();
+            return vec![
+                canvas.into(),
+                corner_caption(format!("Distortion: {}", d.name)),
+            ];
         }
         // Whether the phase is drawn wrapped or unwrapped.
         let caption = (self.view == View::Phase && !self.phase.is_empty())
@@ -745,10 +921,7 @@ impl Graph {
             View::Distortion => (Some(self.distortion_note.clone()), true),
         };
         let Some(note) = note else {
-            return match caption {
-                Some(caption) => stack![canvas, caption].into(),
-                None => canvas.into(),
-            };
+            return std::iter::once(canvas.into()).chain(caption).collect();
         };
         let note = container(text(note).style(theme::text(|p| p.fg_dim)))
             .padding([4, 10])
@@ -764,12 +937,36 @@ impl Graph {
                 .width(Length::Fill)
                 .height(Length::Fill)
         };
-        stack![canvas, placed].extend(caption).into()
+        [canvas.into(), placed.into()]
+            .into_iter()
+            .chain(caption)
+            .collect()
     }
 }
 
+/// Reset view, in the margin above the plot at its right end: clear of the
+/// plot and the readout cards in it. Its row is the small text's line
+/// height (13 px in any face), inside the 16 px margin.
+fn reset_button<'a>() -> Element<'a, Event> {
+    let reset = button(text("Reset view").size(theme::TEXT_SMALL))
+        .on_press(Event::Reset)
+        .padding([0, 8])
+        .style(theme::button);
+    container(container(reset).style(theme::backdrop))
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(Vertical::Top)
+        .padding(iced::Padding {
+            top: 1.0,
+            right: INSETS.right,
+            ..iced::Padding::ZERO
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
 /// A caption in the plot's bottom-left corner.
-fn corner_caption<'a>(content: String) -> Element<'a, Hover> {
+fn corner_caption<'a>(content: String) -> Element<'a, Event> {
     let caption = container(
         text(content)
             .size(LABEL_SIZE)
@@ -891,7 +1088,30 @@ struct Plot<'a> {
     hover: Option<(f64, f64)>,
 }
 
-impl canvas::Program<Hover> for Plot<'_> {
+/// The wheel over an axis's labels of `plot` at `at` (in the canvas): the
+/// band under the plot is the frequency axis's, the one left of it the
+/// level axis's. `None` over the plot itself or elsewhere.
+fn wheel_axis(plot: &PlotBox, at: Point) -> Option<(Axis, f32)> {
+    let across = (plot.left..=plot.right()).contains(&at.x);
+    let along = (plot.top..=plot.bottom()).contains(&at.y);
+    if across && at.y > plot.bottom() {
+        Some((Axis::Frequency, at.x))
+    } else if along && at.x < plot.left {
+        Some((Axis::Level, at.y))
+    } else {
+        None
+    }
+}
+
+/// A wheel delta in notches, up positive.
+fn wheel_lines(delta: mouse::ScrollDelta) -> f64 {
+    match delta {
+        mouse::ScrollDelta::Lines { y, .. } => f64::from(y),
+        mouse::ScrollDelta::Pixels { y, .. } => f64::from(y / zoom::PIXELS_PER_LINE),
+    }
+}
+
+impl canvas::Program<Event> for Plot<'_> {
     /// The hover last published.
     type State = Option<Hover>;
 
@@ -901,13 +1121,27 @@ impl canvas::Program<Hover> for Plot<'_> {
         event: &canvas::Event,
         bounds: Rectangle,
         cursor: Cursor,
-    ) -> Option<canvas::Action<Hover>> {
+    ) -> Option<canvas::Action<Event>> {
+        let plot = PlotBox::inside(bounds.width, bounds.height, INSETS);
+        if let canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            let (axis, at) = wheel_axis(&plot, cursor.position_in(bounds)?)?;
+            let lines = wheel_lines(*delta);
+            if lines == 0.0 {
+                return None;
+            }
+            let wheel = Wheel {
+                axis,
+                plot,
+                at,
+                lines,
+            };
+            return Some(canvas::Action::publish(Event::Wheel(wheel)).and_capture());
+        }
         let canvas::Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) =
             event
         else {
             return None;
         };
-        let plot = PlotBox::inside(bounds.width, bounds.height, INSETS);
         let hover = match cursor.position_in(bounds) {
             Some(at) if plot.contains(at.x, at.y) => {
                 let (axis, top) = self.graph.axis(plot);
@@ -922,7 +1156,7 @@ impl canvas::Program<Hover> for Plot<'_> {
             return None;
         }
         *last = Some(hover);
-        Some(canvas::Action::publish(hover))
+        Some(canvas::Action::publish(Event::Hover(hover)))
     }
 
     fn draw(
@@ -961,7 +1195,8 @@ impl canvas::Program<Hover> for Plot<'_> {
         });
         let live = graph.live_cache.draw(renderer, size, |frame| {
             if let (View::Response, Some(response)) = (graph.view, &graph.live) {
-                draw_live(frame, &plot, response, top_db, &p);
+                let pin = graph.pins();
+                draw_live(frame, &plot, response, top_db, pin, &p);
             }
         });
         let mut overlay = Frame::new(renderer, size);
@@ -981,7 +1216,7 @@ impl canvas::Program<Hover> for Plot<'_> {
                     draw_phase_hover(&mut overlay, &plot, graph, top_db, freq, db, &p);
                 }
                 View::Distortion => {
-                    draw_distortion_hover(&mut overlay, &plot, graph, freq, db, &p);
+                    draw_distortion_hover(&mut overlay, &plot, graph, top_db, freq, db, &p);
                 }
             }
         }
@@ -1033,11 +1268,14 @@ fn draw_frame(frame: &mut Frame, plot: &PlotBox, p: &Palette) {
             .with_color(p.border)
             .with_width(theme::HAIRLINE),
     );
-    let labelled = plot::freq_label_multiples(plot.width, LABEL_SIZE);
-    for (f, tick) in plot::freq_grid() {
+    let (low, high) = (plot.f_low, plot.f_high);
+    let lines = plot::freq_grid(low, high, plot.width);
+    let labelled = plot::freq_labelled(&lines, low, high, plot.width, LABEL_SIZE);
+    for (grid, labelled) in lines.iter().zip(labelled) {
+        let f = grid.freq;
         let x = plot.x_of(f);
-        let color = match tick {
-            Tick::Minor => p.bg_overlay,
+        let color = match grid.tick {
+            Tick::Fine | Tick::Minor => p.bg_overlay,
             Tick::Major | Tick::Decade => p.border,
         };
         line(
@@ -1046,7 +1284,7 @@ fn draw_frame(frame: &mut Frame, plot: &PlotBox, p: &Palette) {
             Point::new(x, plot.bottom()),
             color,
         );
-        if labelled.contains(&plot::multiple(f)) {
+        if labelled {
             frame.fill_text(label(
                 plot::freq_tick(f),
                 Point::new(x, plot.bottom() + 6.0),
@@ -1064,8 +1302,8 @@ fn draw_db_grid(frame: &mut Frame, plot: &PlotBox, top_db: f64, p: &Palette) {
     let labels = label_step(plot, lines, majors);
     for db in plot::db_grid(top_db, plot.span, lines) {
         let y = plot.y_of(db, top_db);
-        let labelled = (db / labels).fract() == 0.0;
-        let color = if (db / majors).fract() == 0.0 {
+        let labelled = on_step(db, labels);
+        let color = if on_step(db, majors) {
             p.border
         } else {
             p.bg_overlay
@@ -1088,16 +1326,22 @@ fn draw_db_grid(frame: &mut Frame, plot: &PlotBox, top_db: f64, p: &Palette) {
     }
 }
 
-/// The phase lines (every 45°) and their labels (spaced to fit the plot's
-/// height: see [`phase_label_step`]).
+/// Whether `value` is a whole multiple of `step`, rounding aside.
+fn on_step(value: f64, step: f64) -> bool {
+    let k = value / step;
+    (k - k.round()).abs() < 1e-6
+}
+
+/// The phase lines (every 45°, finer on a zoomed axis: see
+/// [`phase_steps`]) and their labels (spaced to fit the plot's height: see
+/// [`phase_label_step`]).
 fn draw_phase_grid(frame: &mut Frame, plot: &PlotBox, top: f64, p: &Palette) {
-    let steps = (plot.span / PHASE_LINES).round() as i32;
+    let (lines, majors) = phase_steps(plot);
     let labels = phase_label_step(plot);
-    for k in 0..=steps {
-        let deg = top - f64::from(k) * PHASE_LINES;
+    for deg in plot::db_grid(top, plot.span, lines) {
         let y = plot.y_of(deg, top);
-        let labelled = (deg / labels).fract() == 0.0;
-        let color = if (deg / PHASE_MAJORS).fract() == 0.0 {
+        let labelled = on_step(deg, labels);
+        let color = if on_step(deg, majors) {
             p.border
         } else {
             p.bg_overlay
@@ -1144,21 +1388,26 @@ fn draw_phase_traces(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64,
                 .map(<[_]>::to_vec)
                 .collect()
         };
+        let runs = runs.iter().flat_map(|run| {
+            cut_runs(
+                run.iter()
+                    .map(|(f, deg)| Point::new(plot.x_of(*f), plot.y_of(*deg, top))),
+                plot,
+                graph.pins(),
+            )
+        });
         let path = Path::new(|b| {
-            for run in &runs {
-                let mut points = run
-                    .iter()
-                    .map(|(f, deg)| Point::new(plot.x_of(*f), plot.y_of(*deg, top)));
-                let Some(first) = points.next() else {
+            for run in runs {
+                let [first, rest @ ..] = run.as_slice() else {
                     continue;
                 };
-                if run.len() == 1 {
+                if rest.is_empty() {
                     // Alone between gaps: a dot.
-                    b.circle(first, 0.75);
+                    b.circle(*first, 0.75);
                     continue;
                 }
-                b.move_to(first);
-                for at in points {
+                b.move_to(*first);
+                for &at in rest {
                     b.line_to(at);
                 }
             }
@@ -1173,12 +1422,30 @@ fn draw_phase_traces(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64,
     }
 }
 
+/// The fewest labelled lines a short (zoomed) dB axis aims for.
+const MIN_DB_LABELS: f64 = 3.0;
+
 /// The dB between grid lines and between labels: 5 and 10, scaled up by 2,
 /// 5, 10, … when a narrow plot's labels would overlap, which also bounds the
-/// number of lines by the plot's height.
+/// number of lines by the plot's height; scaled down by 2, 5 and 10 on an axis
+/// too short for [`MIN_DB_LABELS`] of them, down to 0.5 and 1.
 fn db_steps(plot: &PlotBox) -> (f64, f64) {
     let label_px = f64::from(plot.height) * DB_LABELS / plot.span;
     let need = f64::from(LABEL_SIZE + 4.0) / label_px;
+    let shortest = if plot.span >= DB_LABELS * MIN_DB_LABELS {
+        1.0
+    } else {
+        [0.5, 0.2, 0.1]
+            .into_iter()
+            .find(|&s| DB_LABELS * MIN_DB_LABELS * s <= plot.span)
+            .unwrap_or(0.1)
+    };
+    if let Some(stride) = [0.1, 0.2, 0.5]
+        .into_iter()
+        .find(|&s| s >= shortest && s >= need)
+    {
+        return (DB_LINES * stride, DB_LABELS * stride);
+    }
     let mut stride = 1.0;
     'search: loop {
         for m in [1.0, 2.0, 5.0] {
@@ -1204,11 +1471,21 @@ fn label_step(plot: &PlotBox, lines: f64, majors: f64) -> f64 {
     }
 }
 
-/// The degrees between phase labels: every 45° or 90° line as
-/// [`label_step`] says, thinned further (180°, 360°…) where a 90° step is
-/// closer than a label's height and a little room.
+/// The degrees between phase lines and between the brighter ones: 45° and
+/// 90°, finer on an axis too short for two of the brighter ones.
+fn phase_steps(plot: &PlotBox) -> (f64, f64) {
+    [(PHASE_LINES, PHASE_MAJORS), (15.0, 45.0), (5.0, 15.0)]
+        .into_iter()
+        .find(|(_, majors)| plot.span >= 2.0 * majors)
+        .unwrap_or((1.0, 5.0))
+}
+
+/// The degrees between phase labels: every line or every brighter one as
+/// [`label_step`] says, thinned further (doubled) where that is closer than
+/// a label's height and a little room.
 fn phase_label_step(plot: &PlotBox) -> f64 {
-    let mut step = label_step(plot, PHASE_LINES, PHASE_MAJORS);
+    let (lines, majors) = phase_steps(plot);
+    let mut step = label_step(plot, lines, majors);
     let px = |step: f64| f64::from(plot.height) * step / plot.span;
     while step < plot.span && px(step) < f64::from(LABEL_SIZE + 4.0) {
         step *= 2.0;
@@ -1216,20 +1493,32 @@ fn phase_label_step(plot: &PlotBox) -> f64 {
     step
 }
 
-/// Whether the percent axis has room to label the 2× and 5× lines of each
-/// decade: their closest neighbours are a third of a decade apart.
+/// Whether the percent axis `plot` (its span in decades) has room to label
+/// the 2× and 5× lines of each decade: their closest neighbours are a third
+/// of a decade apart.
 fn percent_minor_labels(plot: &PlotBox) -> bool {
-    f64::from(plot.height) / PCT_SPAN * 2f64.log10() >= f64::from(LABEL_ROOM)
+    f64::from(plot.height) / plot.span * 2f64.log10() >= f64::from(LABEL_ROOM)
 }
 
-/// A percent axis label: "0.01 %", "0.5 %", "20 %".
+/// Whether a zoomed percent axis has room to label every line: 9× and 10×
+/// are the closest.
+fn percent_all_labels(plot: &PlotBox) -> bool {
+    f64::from(plot.height) / plot.span * (10f64 / 9.0).log10() >= f64::from(LABEL_SIZE + 4.0)
+}
+
+/// A percent axis label, compact to fit left of the plot: "0.01%", "0.5%",
+/// "20%", and beyond 0.01–900 % (a zoomed-out axis) "1e-4%", "5e3%".
 fn percent_tick(decade: i32, m: u32) -> String {
+    if !(-2..=2).contains(&decade) {
+        return format!("{m}e{decade}%");
+    }
     let decimals = (-decade).max(0) as usize;
-    format!("{:.*} %", decimals, 10f64.powi(decade) * f64::from(m))
+    format!("{:.*}%", decimals, 10f64.powi(decade) * f64::from(m))
 }
 
 /// Each trace in its colour, broken where it has no data and held to the
-/// plot: cut at 20 Hz and 20 kHz, levels beyond the axis pinned to its edge.
+/// plot: cut at the frequencies in view, levels beyond the axis pinned to
+/// its edge (cut there too on a zoomed level axis: see [`Graph::pins`]).
 ///
 /// Clipped by hand: iced_wgpu 0.14 drops what a `Frame::with_clip` draft
 /// draws in this cached layer (the traces vanished from wgpu snapshots
@@ -1237,7 +1526,7 @@ fn percent_tick(decade: i32, m: u32) -> String {
 fn draw_traces(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top_db: f64, p: &Palette) {
     for trace in &graph.traces {
         frame.stroke(
-            &trace_path(plot, &trace.response, top_db),
+            &trace_path(plot, &trace.response, top_db, graph.pins()),
             Stroke::default()
                 .with_color(p.trace(trace.color))
                 .with_width(TRACE_WIDTH)
@@ -1248,9 +1537,16 @@ fn draw_traces(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top_db: f64, p:
 
 /// The RTA's live trace: the foreground colour, dashed, so it never
 /// shares a colour with a measurement.
-fn draw_live(frame: &mut Frame, plot: &PlotBox, response: &Response, top_db: f64, p: &Palette) {
+fn draw_live(
+    frame: &mut Frame,
+    plot: &PlotBox,
+    response: &Response,
+    top_db: f64,
+    pin: bool,
+    p: &Palette,
+) {
     frame.stroke(
-        &trace_path(plot, response, top_db),
+        &trace_path(plot, response, top_db, pin),
         Stroke {
             line_dash: canvas::LineDash {
                 segments: &[6.0, 4.0],
@@ -1265,24 +1561,106 @@ fn draw_live(frame: &mut Frame, plot: &PlotBox, response: &Response, top_db: f64
 }
 
 /// `response` as a line, broken where it has no data.
-fn trace_path(plot: &PlotBox, response: &Response, top_db: f64) -> Path {
+fn trace_path(plot: &PlotBox, response: &Response, top_db: f64, pin: bool) -> Path {
+    let points = plotted(response).map(|(f, db)| Point::new(plot.x_of(f), plot.y_of(db, top_db)));
+    runs_path(&cut_runs(points, plot, pin))
+}
+
+/// A line through the runs [`cut_runs`] gives.
+fn runs_path(runs: &[Vec<Point>]) -> Path {
     Path::new(|b| {
-        let mut drawing = false;
-        for (f, db) in plotted(response) {
-            if !db.is_finite() {
-                drawing = false;
+        for run in runs {
+            let mut run = run.iter();
+            let Some(&first) = run.next() else {
                 continue;
-            }
-            let y = plot.y_of(db, top_db).clamp(plot.top, plot.bottom());
-            let at = Point::new(plot.x_of(f), y);
-            if drawing {
+            };
+            b.move_to(first);
+            for &at in run {
                 b.line_to(at);
-            } else {
-                b.move_to(at);
-                drawing = true;
             }
         }
     })
+}
+
+/// `points` (in pixels) as the runs a line joins: broken at gaps (a `NaN`),
+/// cut where they cross the plot's left and right edges (the frequencies in
+/// view), and pinned to its top and bottom edges, or cut there too unless
+/// `pin`. A point alone between gaps is a run of one.
+fn cut_runs(points: impl IntoIterator<Item = Point>, plot: &PlotBox, pin: bool) -> Vec<Vec<Point>> {
+    let inside = |at: Point| {
+        (plot.left..=plot.right()).contains(&at.x)
+            && (pin || (plot.top..=plot.bottom()).contains(&at.y))
+    };
+    let pinned = |at: Point| Point::new(at.x, at.y.clamp(plot.top, plot.bottom()));
+    let mut runs: Vec<Vec<Point>> = Vec::new();
+    let mut run: Vec<Point> = Vec::new();
+    let mut last: Option<Point> = None;
+    for at in points {
+        if !(at.x.is_finite() && at.y.is_finite()) {
+            runs.extend((!run.is_empty()).then(|| std::mem::take(&mut run)));
+            last = None;
+            continue;
+        }
+        match last {
+            None if inside(at) => run.push(pinned(at)),
+            None => {}
+            Some(from) => match cut_segment(from, at, plot, !pin) {
+                None => runs.extend((!run.is_empty()).then(|| std::mem::take(&mut run))),
+                Some((start, end, cut)) => {
+                    if cut || run.is_empty() {
+                        runs.extend((!run.is_empty()).then(|| std::mem::take(&mut run)));
+                        run.push(pinned(start));
+                    }
+                    run.push(pinned(end));
+                }
+            },
+        }
+        last = Some(at);
+    }
+    runs.extend((!run.is_empty()).then_some(run));
+    runs
+}
+
+/// The part of the segment `a`–`b` between the plot's left and right
+/// edges, and its top and bottom ones too when `vertical`, with whether its
+/// start was cut; `None` when none of it is.
+fn cut_segment(a: Point, b: Point, plot: &PlotBox, vertical: bool) -> Option<(Point, Point, bool)> {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let edges = [
+        (-dx, a.x - plot.left),
+        (dx, plot.right() - a.x),
+        (-dy, a.y - plot.top),
+        (dy, plot.bottom() - a.y),
+    ];
+    // Liang–Barsky: narrow the share of the segment inside, edge by edge.
+    let (mut from, mut to) = (0f32, 1f32);
+    for (p, q) in edges.into_iter().take(if vertical { 4 } else { 2 }) {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let t = q / p;
+        if p < 0.0 {
+            from = from.max(t);
+        } else {
+            to = to.min(t);
+        }
+    }
+    if from > to {
+        return None;
+    }
+    let at = |t: f32| {
+        if t == 0.0 {
+            a
+        } else if t == 1.0 {
+            b
+        } else {
+            Point::new(a.x + t * dx, a.y + t * dy)
+        }
+    };
+    Some((at(from), at(to), from > 0.0))
 }
 
 /// `response`'s points inside the plotted decades, with its levels at the
@@ -1308,7 +1686,7 @@ fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p
         return;
     };
     match d.units {
-        Units::Percent => draw_percent_grid(frame, plot, p),
+        Units::Percent => draw_percent_grid(frame, plot, top, p),
         Units::Db => draw_db_grid(frame, plot, top, p),
     }
     let ink = |ink: Ink| match ink {
@@ -1318,25 +1696,7 @@ fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p
     };
     let mut ends = Vec::new();
     for curve in &d.curves {
-        let path = Path::new(|b| {
-            let mut drawing = false;
-            for (f, y) in curve.plotted() {
-                if !y.is_finite() {
-                    drawing = false;
-                    continue;
-                }
-                let at = Point::new(
-                    plot.x_of(f),
-                    plot.y_of(y, top).clamp(plot.top, plot.bottom()),
-                );
-                if drawing {
-                    b.line_to(at);
-                } else {
-                    b.move_to(at);
-                    drawing = true;
-                }
-            }
-        });
+        let runs = curve_runs(curve, plot, top, graph.pins());
         let width = if curve.thick { THD_WIDTH } else { TRACE_WIDTH };
         let stroke = Stroke {
             line_dash: if curve.dashed {
@@ -1352,10 +1712,9 @@ fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p
                 .with_width(width)
                 .with_line_join(canvas::LineJoin::Round)
         };
-        frame.stroke(&path, stroke);
-        let last = curve.plotted().filter(|(_, y)| y.is_finite()).last();
-        if let (true, Some((_, y))) = (curve.labelled, last) {
-            ends.push((plot.y_of(y, top), curve));
+        frame.stroke(&runs_path(&runs), stroke);
+        if let (true, Some(end)) = (curve.labelled, line_end(&runs)) {
+            ends.push((end.y, curve));
         }
     }
     // Names at the right end of their curves, spread so they stay apart and
@@ -1380,6 +1739,23 @@ fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p
     }
 }
 
+/// `curve` as the runs of its line on `plot`, topped at `top`.
+fn curve_runs(curve: &Curve, plot: &PlotBox, top: f64, pin: bool) -> Vec<Vec<Point>> {
+    let points = curve
+        .plotted()
+        .map(|(f, y)| Point::new(plot.x_of(f), plot.y_of(y, top)));
+    cut_runs(points, plot, pin)
+}
+
+/// Where the line of `runs` ends on the right: the last point drawn, an
+/// edge crossing included. `None` when no line is drawn.
+fn line_end(runs: &[Vec<Point>]) -> Option<Point> {
+    runs.iter()
+        .rev()
+        .filter(|r| r.len() > 1)
+        .find_map(|r| r.last().copied())
+}
+
 /// Rows for names wanting the sorted `wanted` heights: spread so they stay apart and inside
 /// the plot. `None` when the plot is too short for them; the curves' names are on hover.
 fn label_rows(wanted: &[f32], plot: &PlotBox) -> Option<Vec<f32>> {
@@ -1402,33 +1778,58 @@ fn label_rows(wanted: &[f32], plot: &PlotBox) -> Option<Vec<f32>> {
     Some(ys)
 }
 
-/// The percent axis: a line per decade with its label, and fainter lines at
-/// 2..9 times each, the 2× and 5× ones labelled when there is room.
-fn draw_percent_grid(frame: &mut Frame, plot: &PlotBox, p: &Palette) {
+/// A line of the percent axis: its height, whether it is a decade's, and
+/// its label, if it has one.
+type PercentLine = (f32, bool, Option<String>);
+
+/// The percent axis's lines: one per decade, and fainter ones at 2..9 times
+/// each. The decades are labelled, every few of them where a decade is
+/// shorter than a label's row; the 2× and 5× lines too when there is room.
+fn percent_lines(plot: &PlotBox, top: f64) -> Vec<PercentLine> {
     let minors = percent_minor_labels(plot);
-    for decade in -2..=2 {
+    let all = percent_all_labels(plot);
+    let bottom = top - plot.span;
+    let stride = (f64::from(LABEL_SIZE + 4.0) * plot.span / f64::from(plot.height))
+        .ceil()
+        .max(1.0) as i32;
+    let mut out = Vec::new();
+    for decade in bottom.floor() as i32..=top.floor() as i32 {
         for m in 1..=9 {
             let pct = 10f64.powi(decade) * f64::from(m);
-            if pct > 100.0 {
-                break;
+            let at = pct.log10();
+            if at < bottom - 1e-9 || at > top + 1e-9 {
+                continue;
             }
-            let y = percent_y(plot, pct);
             let major = m == 1;
-            line(
-                frame,
-                Point::new(plot.left, y),
-                Point::new(plot.right(), y),
-                if major { p.border } else { p.bg_overlay },
-            );
-            if major || (minors && (m == 2 || m == 5)) {
-                frame.fill_text(label(
-                    percent_tick(decade, m),
-                    Point::new(plot.left - 6.0, y),
-                    Alignment::Right,
-                    Vertical::Center,
-                    p,
-                ));
-            }
+            let labelled =
+                (major && decade.rem_euclid(stride) == 0) || all || (minors && (m == 2 || m == 5));
+            out.push((
+                percent_y(plot, top, pct),
+                major,
+                labelled.then(|| percent_tick(decade, m)),
+            ));
+        }
+    }
+    out
+}
+
+/// The percent axis's lines and labels: see [`percent_lines`].
+fn draw_percent_grid(frame: &mut Frame, plot: &PlotBox, top: f64, p: &Palette) {
+    for (y, major, tick) in percent_lines(plot, top) {
+        line(
+            frame,
+            Point::new(plot.left, y),
+            Point::new(plot.right(), y),
+            if major { p.border } else { p.bg_overlay },
+        );
+        if let Some(tick) = tick {
+            frame.fill_text(label(
+                tick,
+                Point::new(plot.left - 6.0, y),
+                Alignment::Right,
+                Vertical::Center,
+                p,
+            ));
         }
     }
 }
@@ -1439,6 +1840,7 @@ fn draw_distortion_hover(
     frame: &mut Frame,
     plot: &PlotBox,
     graph: &Graph,
+    top: f64,
     freq: f64,
     y: f64,
     p: &Palette,
@@ -1450,7 +1852,6 @@ fn draw_distortion_hover(
         Point::new(x, plot.bottom()),
         p.fg_faint,
     );
-    let top = graph.axis(*plot).1;
     let readout = match graph
         .distortion
         .as_ref()
@@ -1503,7 +1904,12 @@ fn draw_hover(
     );
     let lines = readout_lines(&graph.traces, graph.live.as_ref(), freq);
     for (_, ink, level) in &lines {
-        let y = plot.y_of(*level, top_db).clamp(plot.top, plot.bottom());
+        let y = plot.y_of(*level, top_db);
+        // Off a zoomed axis, no dot; off the fitted one, on its edge.
+        if !graph.pins() && !(plot.top..=plot.bottom()).contains(&y) {
+            continue;
+        }
+        let y = y.clamp(plot.top, plot.bottom());
         let color = match ink {
             Ink::Trace(i) => p.trace(*i),
             Ink::Fg => p.fg,
@@ -1612,13 +2018,16 @@ fn draw_phase_hover(
     let readout = match nearest_phase(traces, freq, deg, wrapped) {
         Some((trace, at)) => {
             let y = plot.y_of(at, top);
-            line(
-                frame,
-                Point::new(plot.left, y),
-                Point::new(plot.right(), y),
-                p.fg_faint,
-            );
-            frame.fill(&Path::circle(Point::new(x, y), 3.5), p.trace(trace.color));
+            // Off a zoomed axis, the readout alone.
+            if (plot.top..=plot.bottom()).contains(&y) {
+                line(
+                    frame,
+                    Point::new(plot.left, y),
+                    Point::new(plot.right(), y),
+                    p.fg_faint,
+                );
+                frame.fill(&Path::circle(Point::new(x, y), 3.5), p.trace(trace.color));
+            }
             format!("{}  {}", plot::freq_label(freq), plot::phase_label(at))
         }
         None => plot::freq_label(freq),
@@ -1713,14 +2122,21 @@ mod tests {
     // Bugs caught: 0, False positives: 0
     #[test]
     fn a_tall_plot_labels_2_and_5_percent_lines() {
-        assert!(percent_minor_labels(&sized(1000.0, 600.0)));
-        assert!(!percent_minor_labels(&sized(1000.0, 200.0)));
-        assert_eq!(percent_tick(-2, 1), "0.01 %");
-        assert_eq!(percent_tick(-2, 5), "0.05 %");
-        assert_eq!(percent_tick(-1, 2), "0.2 %");
-        assert_eq!(percent_tick(0, 5), "5 %");
-        assert_eq!(percent_tick(1, 2), "20 %");
-        assert_eq!(percent_tick(2, 1), "100 %");
+        let percent = |h| PlotBox {
+            span: PCT_SPAN,
+            ..sized(1000.0, h)
+        };
+        assert!(percent_minor_labels(&percent(600.0)));
+        assert!(!percent_minor_labels(&percent(200.0)));
+        assert_eq!(percent_tick(-2, 1), "0.01%");
+        assert_eq!(percent_tick(-2, 5), "0.05%");
+        assert_eq!(percent_tick(-1, 2), "0.2%");
+        assert_eq!(percent_tick(0, 5), "5%");
+        assert_eq!(percent_tick(1, 2), "20%");
+        assert_eq!(percent_tick(2, 1), "100%");
+        // The decades a zoomed-out axis adds, compact.
+        assert_eq!(percent_tick(-4, 1), "1e-4%");
+        assert_eq!(percent_tick(3, 5), "5e3%");
     }
 
     // Bugs caught: 0, False positives: 0
@@ -2208,14 +2624,18 @@ mod tests {
     // Bugs caught: 0, False positives: 0
     #[test]
     fn percent_axis_maps_decades() {
-        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
-        assert_eq!(percent_y(&plot, 0.01), plot.bottom());
-        assert_eq!(percent_y(&plot, 100.0), plot.top);
+        let graph = Graph {
+            view: View::Distortion,
+            ..Graph::default()
+        };
+        let (plot, top) = graph.axis(PlotBox::inside(1000.0, 600.0, INSETS));
+        assert_eq!(percent_y(&plot, top, 0.01), plot.bottom());
+        assert_eq!(percent_y(&plot, top, 100.0), plot.top);
         let step = (plot.bottom() - plot.top) / 4.0;
-        assert!((percent_y(&plot, 1.0) - (plot.top + 2.0 * step)).abs() < 1e-3);
-        assert!((percent_y(&plot, 10.0) - (plot.top + step)).abs() < 1e-3);
-        assert_eq!(percent_y(&plot, 0.0001), plot.bottom());
-        assert_eq!(percent_y(&plot, 0.0), plot.bottom());
+        assert!((percent_y(&plot, top, 1.0) - (plot.top + 2.0 * step)).abs() < 1e-3);
+        assert!((percent_y(&plot, top, 10.0) - (plot.top + step)).abs() < 1e-3);
+        assert_eq!(percent_y(&plot, top, 0.0001), plot.bottom());
+        assert_eq!(percent_y(&plot, top, 0.0), plot.bottom());
     }
 
     // A gap in a curve stays a gap on the percent axis: it is not read as
@@ -2248,5 +2668,408 @@ mod tests {
             curves: vec![curve],
         };
         assert!(plot.nearest(15_000.0, 0.0).is_none());
+    }
+
+    /// A wheel scroll of `lines` notches over `axis` at `at` on a 1000×600
+    /// canvas.
+    fn wheel(axis: Axis, at: f32, lines: f64) -> Wheel {
+        Wheel {
+            axis,
+            plot: PlotBox::inside(1000.0, 600.0, INSETS),
+            at,
+            lines,
+        }
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_wheel_zooms_only_over_an_axis() {
+        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
+        let mid = Point::new(plot.left + plot.width / 2.0, plot.top + plot.height / 2.0);
+        let under = Point::new(mid.x, plot.bottom() + 10.0);
+        let beside = Point::new(plot.left - 10.0, mid.y);
+        assert_eq!(wheel_axis(&plot, mid), None);
+        assert_eq!(wheel_axis(&plot, under), Some((Axis::Frequency, mid.x)));
+        assert_eq!(wheel_axis(&plot, beside), Some((Axis::Level, mid.y)));
+        // The corner under the level labels, and the top and right margins.
+        assert_eq!(
+            wheel_axis(&plot, Point::new(10.0, plot.bottom() + 10.0)),
+            None
+        );
+        assert_eq!(wheel_axis(&plot, Point::new(mid.x, 4.0)), None);
+        assert_eq!(
+            wheel_axis(&plot, Point::new(plot.right() + 4.0, mid.y)),
+            None
+        );
+        assert_eq!(
+            wheel_lines(mouse::ScrollDelta::Pixels { x: 0.0, y: -120.0 }),
+            -2.0
+        );
+    }
+
+    // Each view keeps its own zoom; Reset view and Clear's reset put the
+    // automatic axes back.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn each_view_keeps_its_own_zoom() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(80.0)]);
+        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
+        let (fit, top) = graph.axis(plot);
+        graph.wheel(wheel(Axis::Frequency, plot.left + 100.0, 2.0));
+        assert!(graph.is_zoomed());
+        graph.set_view(View::Phase);
+        assert!(!graph.is_zoomed() && graph.any_zoomed());
+        graph.wheel(wheel(Axis::Level, plot.top + 10.0, 1.0));
+        graph.set_view(View::Response);
+        let (zoomed, zoomed_top) = graph.axis(plot);
+        assert!(zoomed.f_high / zoomed.f_low < plot::F_MAX / plot::F_MIN);
+        assert_eq!((zoomed.span, zoomed_top), (fit.span, top));
+        graph.reset_view();
+        assert!(!graph.is_zoomed() && graph.any_zoomed());
+        assert_eq!(graph.axis(plot), (fit, top));
+        graph.reset_zoom();
+        assert!(!graph.any_zoomed());
+    }
+
+    // The readout reads the axes as zoomed: the pointer's frequency stays
+    // under it, and the plot's middle is no longer the full range's middle.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn zoomed_axes_map_the_pointer() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(80.0)]);
+        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
+        let x = plot.left + plot.width * 0.25;
+        let y = plot.top + plot.height * 0.75;
+        let (before, top) = graph.axis(plot);
+        let (f, db) = (before.freq_at(x), before.db_at(y, top));
+        graph.wheel(wheel(Axis::Frequency, x, 3.0));
+        graph.wheel(wheel(Axis::Level, y, 3.0));
+        let (after, top_after) = graph.axis(plot);
+        assert!((after.freq_at(x) / f - 1.0).abs() < 1e-9);
+        assert!((after.db_at(y, top_after) - db).abs() < 1e-9);
+        assert!((after.x_of(f) - x).abs() < 1e-3);
+        let mid = plot.left + plot.width / 2.0;
+        assert!(after.freq_at(mid) < before.freq_at(mid));
+    }
+
+    // Bugs caught: 0, False positives: 1
+    #[test]
+    fn each_level_axis_zooms_in_to_its_least_span() {
+        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
+        let cases = [
+            (View::Response, None, MIN_DB_SPAN),
+            (View::Phase, None, MIN_PHASE_SPAN),
+            (View::Distortion, Some(Units::Percent), MIN_PCT_SPAN),
+            (View::Distortion, Some(Units::Db), MIN_DB_SPAN),
+        ];
+        for (view, units, least) in cases {
+            let mut graph = Graph::default();
+            graph.set_view(view);
+            if let Some(units) = units {
+                graph.set_distortion(Some(DistortionPlot {
+                    name: String::new(),
+                    units,
+                    curves: Vec::new(),
+                }));
+            }
+            let fit = graph.axis(plot).0.span;
+            graph.wheel(wheel(Axis::Level, plot.top + 50.0, 100.0));
+            let (zoomed, _) = graph.axis(plot);
+            assert!((zoomed.span - least).abs() < 1e-9, "{view:?} {units:?}");
+            graph.wheel(wheel(Axis::Level, plot.top + 50.0, -200.0));
+            let (out, _) = graph.axis(plot);
+            assert!((out.span - 2.0 * fit).abs() < 1e-9, "{view:?} {units:?}");
+            // A level zoom leaves the frequency axis alone.
+            assert_eq!((out.f_low, out.f_high), (plot::F_MIN, plot::F_MAX));
+        }
+    }
+
+    // A zoomed axis gets finer lines, and its labels still stand apart.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_zoomed_level_axis_has_finer_lines() {
+        let plot = |span| PlotBox {
+            span,
+            ..sized(1000.0, 500.0)
+        };
+        assert_eq!(db_steps(&plot(50.0)), (DB_LINES, DB_LABELS));
+        assert_eq!(db_steps(&plot(25.0)), (2.5, 5.0));
+        assert_eq!(db_steps(&plot(5.0)), (0.5, 1.0));
+        // The default rules for a 2× zoom out.
+        assert_eq!(db_steps(&plot(100.0)), (DB_LINES, DB_LABELS));
+        assert_eq!(phase_steps(&plot(360.0)), (PHASE_LINES, PHASE_MAJORS));
+        assert_eq!(phase_steps(&plot(100.0)), (15.0, 45.0));
+        assert_eq!(phase_steps(&plot(10.0)), (1.0, 5.0));
+        assert!(on_step(2.5 * 3.0, 2.5) && !on_step(1.5, 1.0));
+        assert!(percent_all_labels(&plot(1.0)));
+        assert!(!percent_all_labels(&plot(PCT_SPAN)));
+    }
+
+    // Traces are cut where they leave the frequencies in view, and pinned
+    // to the top and bottom edges.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn runs_are_cut_at_the_plot_edges() {
+        let plot = sized(100.0, 100.0);
+        let (l, t) = (plot.left, plot.top);
+        let at = |x: f32, y: f32| Point::new(l + x, t + y);
+        let runs = cut_runs(
+            [
+                at(-50.0, 50.0),
+                at(50.0, 50.0),
+                at(150.0, -50.0),
+                at(200.0, 0.0),
+            ],
+            &plot,
+            true,
+        );
+        assert_eq!(runs, [vec![at(0.0, 50.0), at(50.0, 50.0), at(100.0, 0.0)]]);
+        // A gap breaks a run; a point alone between gaps is a run of one.
+        let nan = Point::new(f32::NAN, f32::NAN);
+        let runs = cut_runs(
+            [at(10.0, 10.0), at(20.0, 20.0), nan, at(30.0, 30.0), nan],
+            &plot,
+            true,
+        );
+        assert_eq!(
+            runs,
+            [vec![at(10.0, 10.0), at(20.0, 20.0)], vec![at(30.0, 30.0)]]
+        );
+        // Out and back in: two runs; beyond the bottom, pinned to it.
+        let runs = cut_runs(
+            [
+                at(80.0, 10.0),
+                at(120.0, 10.0),
+                at(120.0, 30.0),
+                at(80.0, 300.0),
+            ],
+            &plot,
+            true,
+        );
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0], [at(80.0, 10.0), at(100.0, 10.0)]);
+        assert_eq!(runs[1].last(), Some(&at(80.0, 100.0)));
+        // Wholly outside: nothing.
+        assert!(cut_runs([at(-10.0, 0.0), at(-5.0, 0.0)], &plot, true).is_empty());
+        // On a zoomed level axis, cut at the top and bottom too: up through
+        // the top, along above it, and back down in.
+        let runs = cut_runs(
+            [
+                at(0.0, 50.0),
+                at(20.0, -50.0),
+                at(60.0, -50.0),
+                at(80.0, 50.0),
+            ],
+            &plot,
+            false,
+        );
+        assert_eq!(
+            runs,
+            [
+                vec![at(0.0, 50.0), at(10.0, 0.0)],
+                vec![at(70.0, 0.0), at(80.0, 50.0)]
+            ]
+        );
+        assert!(cut_runs([at(10.0, -5.0), at(50.0, -5.0)], &plot, false).is_empty());
+    }
+    /// A level wheel of `lines` notches at the middle of `plot`'s level axis.
+    fn level_wheel(plot: PlotBox, lines: f64) -> Wheel {
+        Wheel {
+            axis: Axis::Level,
+            plot,
+            at: plot.top + plot.height / 2.0,
+            lines,
+        }
+    }
+
+    // After a resize, the next gesture starts from the range drawn at the
+    // new size: zooming out never shrinks it, nor zooming in widens it.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_wheel_gesture_after_a_resize_keeps_its_direction() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(80.0)]);
+        let tall = PlotBox::inside(1000.0, 1000.0, INSETS);
+        let short = PlotBox::inside(1000.0, 300.0, INSETS);
+        graph.wheel(level_wheel(tall, -50.0));
+        assert!((graph.axis(tall).0.span - 2.0 * tall.span).abs() < 1e-9);
+        // Drawn within the short plot's own limits.
+        let before = graph.axis(short).0.span;
+        assert!(before <= 2.0 * short.span + 1e-9, "{before}");
+        graph.wheel(level_wheel(short, -1.0));
+        let out = graph.axis(short).0.span;
+        assert!(out >= before - 1e-9, "{before} -> {out}");
+        graph.wheel(level_wheel(short, 1.0));
+        let back = graph.axis(short).0.span;
+        assert!(back < out, "{out} -> {back}");
+        // Zoomed in on the short plot, then made tall: drawn no narrower
+        // than the tall plot allows, and the next notch in narrows it.
+        graph.wheel(level_wheel(short, 50.0));
+        let drawn = graph.axis(tall).0.span;
+        assert!(drawn >= MIN_DB_SPAN - 1e-9, "{drawn}");
+        graph.wheel(level_wheel(tall, 1.0));
+        assert!(graph.axis(tall).0.span <= drawn + 1e-9);
+    }
+
+    // A short, wide plot whose automatic span is under the least zoomed
+    // span: zooming in leaves it be, zooming out widens it.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_fit_tighter_than_the_least_span_is_the_least() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(80.0)]);
+        let thin = PlotBox::inside(2000.0, 100.0, INSETS);
+        let fit = graph.axis(thin).0.span;
+        assert!(fit < MIN_DB_SPAN, "{fit}");
+        graph.wheel(level_wheel(thin, 1.0));
+        assert!(graph.axis(thin).0.span <= fit + 1e-9);
+        graph.wheel(level_wheel(thin, -1.0));
+        assert!(graph.axis(thin).0.span > fit);
+    }
+
+    // With no distortion data there is no level axis to zoom, so no range
+    // is saved to be read in other units later; the frequency axis still
+    // zooms.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn an_empty_distortion_view_ignores_the_level_wheel() {
+        let mut graph = Graph::default();
+        graph.set_view(View::Distortion);
+        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
+        graph.wheel(level_wheel(plot, 2.0));
+        assert!(!graph.is_zoomed());
+        graph.wheel(wheel(Axis::Frequency, plot.left + 100.0, 2.0));
+        assert!(graph.is_zoomed());
+        assert_eq!(graph.zoom().level, None);
+    }
+
+    // Levels so large that the axis's ends round together: the wheel
+    // saves nothing rather than a range without a span.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn levels_too_large_for_a_span_are_not_zoomed() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(1e300)]);
+        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
+        for lines in [1.0, -1.0, 30.0] {
+            graph.wheel(level_wheel(plot, lines));
+            assert!(!graph.is_zoomed(), "{lines}");
+        }
+    }
+
+    /// The width of `content` in `font` at the axis labels' size.
+    fn label_width(content: &str, font: iced::Font) -> f32 {
+        use iced::advanced::text::Paragraph as _;
+        let text = iced::advanced::Text {
+            content,
+            bounds: Size::new(f32::INFINITY, f32::INFINITY),
+            size: LABEL_SIZE.into(),
+            line_height: Default::default(),
+            font,
+            align_x: Alignment::Right,
+            align_y: Vertical::Center,
+            shaping: Text::default().shaping,
+            wrapping: iced::widget::text::Wrapping::None,
+        };
+        iced::advanced::graphics::text::Paragraph::with_text(text)
+            .min_bounds()
+            .width
+    }
+
+    // Every percent label the axis can show, at any zoom, fits left of the
+    // plot: they end 6 px from it, and keep 2 px from the canvas edge. In
+    // the labels' face and in the bundled fallback.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn every_percent_label_fits_the_left_inset() {
+        let fit = Range::new(PCT_TOP - PCT_SPAN, PCT_TOP);
+        let full = zoom::Limits::level(fit, MIN_PCT_SPAN).full;
+        let room = INSETS.left - 6.0 - 2.0;
+        for font in [theme::mono(), iced::Font::with_name(theme::FALLBACK_FAMILY)] {
+            let mut widest = (0.0, String::new());
+            for decade in full.low.floor() as i32..=full.high.floor() as i32 {
+                for m in 1..=9 {
+                    let tick = percent_tick(decade, m);
+                    let width = label_width(&tick, font);
+                    if width > widest.0 {
+                        widest = (width, tick);
+                    }
+                }
+            }
+            assert!(widest.0 > 0.0);
+            assert!(widest.0 <= room, "{font:?}: {widest:?} wider than {room}");
+        }
+    }
+
+    // On a short plot zoomed fully out, the decade labels thin out to stand
+    // a row apart; the lines stay.
+    // Bugs caught: 0, False positives: 1
+    #[test]
+    fn percent_labels_thin_out_when_a_decade_is_short() {
+        let plot = PlotBox {
+            span: 2.0 * PCT_SPAN,
+            ..sized(800.0, 64.0)
+        };
+        let lines = percent_lines(&plot, PCT_TOP + PCT_SPAN / 2.0);
+        let ys: Vec<f32> = lines
+            .iter()
+            .filter(|l| l.2.is_some())
+            .map(|l| l.0)
+            .collect();
+        assert!(ys.len() >= 2, "{lines:?}");
+        assert!(
+            ys.windows(2)
+                .all(|w| (w[1] - w[0]).abs() >= LABEL_SIZE + 4.0),
+            "{ys:?}"
+        );
+        assert_eq!(lines.iter().filter(|l| l.1).count(), 9);
+        // The default fit on a tall plot labels every decade.
+        let tall = PlotBox {
+            span: PCT_SPAN,
+            ..sized(1000.0, 600.0)
+        };
+        let labels: Vec<String> = percent_lines(&tall, PCT_TOP)
+            .into_iter()
+            .filter(|l| l.1)
+            .filter_map(|l| l.2)
+            .collect();
+        assert_eq!(labels, ["0.01%", "0.1%", "1%", "10%", "100%"]);
+    }
+
+    // A curve's name sits where its drawn line ends: none for a harmonic
+    // wholly outside the zoomed view, the edge crossing for one leaving it.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn distortion_names_follow_the_visible_line() {
+        let freq = vec![100.0, 400.0, 800.0, 3000.0, 6000.0];
+        let fundamental = Response {
+            freq: freq.clone(),
+            db: vec![0.0; 5],
+            phase: None,
+        };
+        let level = |db: Vec<f64>| Response {
+            freq: freq.clone(),
+            db,
+            phase: None,
+        };
+        // Data up to 800 Hz only.
+        let early = level(vec![-40.0, -40.0, -40.0, f64::NAN, f64::NAN]);
+        let early = Curve::new("H3", Ink::Fg, &early, &fundamental, Units::Db);
+        // Rising through 2 kHz, the right edge.
+        let rising = level(vec![-60.0, -60.0, -60.0, -40.0, -40.0]);
+        let rising = Curve::new("H2", Ink::Fg, &rising, &fundamental, Units::Db);
+        let plot = sized(500.0, 400.0).with_decades(3.0, 2000f64.log10());
+        let top = 0.0;
+        assert_eq!(line_end(&curve_runs(&early, &plot, top, true)), None);
+        let end = line_end(&curve_runs(&rising, &plot, top, true)).unwrap();
+        assert!((end.x - plot.right()).abs() < 1e-3, "{end:?}");
+        // Between the levels at 800 Hz and 3 kHz, not the one at 800 Hz.
+        let at_800 = plot.y_of(-60.0, top);
+        assert!(end.y < at_800 - 1.0, "{end:?}");
+        // Wholly above a zoomed level axis: cut, so no name either.
+        let low = PlotBox { span: 10.0, ..plot };
+        assert_eq!(line_end(&curve_runs(&rising, &low, -70.0, false)), None);
     }
 }

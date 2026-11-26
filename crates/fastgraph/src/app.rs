@@ -238,7 +238,8 @@ pub enum Message {
     StimulusRendered(SweepLength, Rendered),
     /// An item's id, and whether the graph shows it.
     Shown(String, bool),
-    Graph(graph::Hover),
+    /// The pointer over the graph, the wheel over its axes, or Reset view.
+    Graph(graph::Event),
     /// A tab over the graph.
     GraphViewSelected(graph::View),
     /// The Distortion view's units.
@@ -820,8 +821,12 @@ impl App {
             Message::StimulusSaved(Ok(path)) => self.info(format!("Saved {}", path.display())),
             Message::StimulusSaved(Err(e)) => self.error(format!("WAV not saved: {e}")),
             Message::Shown(id, shown) => return self.set_shown(&id, shown),
-            Message::Graph(graph::Hover::At { freq, db }) => self.hover = Some((freq, db)),
-            Message::Graph(graph::Hover::Left) => self.hover = None,
+            Message::Graph(graph::Event::Hover(graph::Hover::At { freq, db })) => {
+                self.hover = Some((freq, db));
+            }
+            Message::Graph(graph::Event::Hover(graph::Hover::Left)) => self.hover = None,
+            Message::Graph(graph::Event::Wheel(wheel)) => self.graph.wheel(wheel),
+            Message::Graph(graph::Event::Reset) => self.graph.reset_view(),
             Message::FirstFrame => return iced::exit(),
             Message::Frame(at) => self.now = at,
             Message::Reconnect => match self.connect() {
@@ -878,6 +883,10 @@ impl App {
                 self.redraw();
             }
             Message::UnitsPicked(units) => {
+                // The other units are another axis.
+                if units != self.units {
+                    self.graph.reset_level(graph::View::Distortion);
+                }
                 self.units = units;
                 self.redraw();
             }
@@ -1458,6 +1467,7 @@ impl App {
             && self.sweep_mode
             && self.pane == Pane::Measure
             && self.graph_view == graph::View::Response
+            && !self.graph.any_zoomed()
     }
 
     /// The Clear button: end any activity and return the session to its
@@ -1512,6 +1522,7 @@ impl App {
             self.now,
         );
         self.graph.set_view(graph::View::Response);
+        self.graph.reset_zoom();
         self.redraw();
     }
 

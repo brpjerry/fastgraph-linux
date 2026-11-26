@@ -20,6 +20,7 @@ mod tabs;
 mod testing;
 mod theme;
 mod toolbar;
+mod zoom;
 
 use app::App;
 use iced::window;
