@@ -142,6 +142,7 @@ fn name<'a>(app: &'a App, item: &'a Item) -> Element<'a, Message> {
             .size(theme::TEXT)
             .padding([1, 4])
             .width(Length::Fixed(140.0))
+            .style(theme::input)
             .into(),
         _ => button(text(&item.m.meta.name))
             .on_press(Message::Select(item.m.meta.id.clone()))

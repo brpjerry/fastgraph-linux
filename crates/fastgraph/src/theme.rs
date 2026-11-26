@@ -38,6 +38,10 @@ pub struct Palette {
     pub bg_raised: Color,
     /// Input fields, and resting fills of controls.
     pub bg_overlay: Color,
+    /// Text box fill: darker than the controls' hover fills, lighter than `bg`.
+    pub input_bg: Color,
+    /// Text box outline at rest.
+    pub input_border: Color,
     /// 1 px hairline between surfaces.
     pub border: Color,
     /// A hovered or focused control's border.
@@ -75,6 +79,8 @@ impl Palette {
             bg,
             bg_raised: color!(0x141414),
             bg_overlay: color!(0x1e1e1e),
+            input_bg: color!(0x111111),
+            input_border: color!(0x3c3c3c),
             border: color!(0x2e2e2e),
             border_focus: darken(accent, 0.48),
             fg,
@@ -367,18 +373,39 @@ fn tint(p: &Palette, status: widget::button::Status) -> Option<Color> {
     }
 }
 
-/// A text box style that draws its text in the error colour while `valid` is
-/// false.
+/// The shared text box style: a dark fill, a hairline rounded outline that
+/// takes the accent on focus, and the error colour for text while invalid.
 pub fn input_checked(
     valid: bool,
 ) -> impl Fn(&Theme, widget::text_input::Status) -> widget::text_input::Style {
     move |theme, status| {
-        let mut style = widget::text_input::default(theme, status);
-        if !valid {
-            style.value = Palette::of(theme).err;
+        let p = Palette::of(theme);
+        let edge = match status {
+            widget::text_input::Status::Focused { .. } => p.accent,
+            widget::text_input::Status::Hovered => p.border_focus,
+            _ => p.input_border,
+        };
+        let disabled = status == widget::text_input::Status::Disabled;
+        widget::text_input::Style {
+            background: p.input_bg.into(),
+            border: border(edge),
+            icon: p.fg_dim,
+            placeholder: p.fg_faint,
+            value: if !valid {
+                p.err
+            } else if disabled {
+                p.disabled
+            } else {
+                p.fg
+            },
+            selection: p.selected,
         }
-        style
     }
+}
+
+/// The text box style for boxes with no validity check.
+pub fn input(theme: &Theme, status: widget::text_input::Status) -> widget::text_input::Style {
+    input_checked(true)(theme, status)
 }
 
 /// A plain button: a hairline frame, secondary
@@ -644,6 +671,44 @@ mod tests {
     fn contrast(a: Color, b: Color) -> f32 {
         let (a, b) = (luminance(a), luminance(b));
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn text_boxes_are_outlined_and_filled_apart_from_buttons_and_background() {
+        let theme = Theme::Dark;
+        let p = Palette::of(&theme);
+        let button_fills = [
+            widget::button::Status::Active,
+            widget::button::Status::Hovered,
+            widget::button::Status::Pressed,
+        ]
+        .map(|s| button(&theme, s).background);
+        for status in [
+            widget::text_input::Status::Active,
+            widget::text_input::Status::Hovered,
+            widget::text_input::Status::Focused { is_hovered: false },
+        ] {
+            let style = input(&theme, status);
+            assert!(style.border.width > 0.0);
+            assert_eq!(style.border.width, HAIRLINE);
+            assert_eq!(style.border.radius, RADIUS.into());
+            let fill = style.background;
+            assert_ne!(fill, p.bg.into());
+            for b in button_fills {
+                assert_ne!(Some(fill), b);
+            }
+            for fill_of in [p.hover, p.pressed, p.selected, p.accent_dim, p.accent] {
+                assert_ne!(fill, fill_of.into());
+            }
+        }
+        let focused = input(
+            &theme,
+            widget::text_input::Status::Focused { is_hovered: false },
+        );
+        assert_eq!(focused.border.color, p.accent);
+        let invalid = input_checked(false)(&theme, widget::text_input::Status::Active);
+        assert_eq!(invalid.value, p.err);
     }
 
     // Bugs caught: 0, False positives: 0

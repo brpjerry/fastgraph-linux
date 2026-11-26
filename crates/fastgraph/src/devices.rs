@@ -157,7 +157,8 @@ fn save_row(app: &App) -> Element<'_, Message> {
             .on_submit(Message::SaveSet)
             .size(theme::TEXT)
             .padding([4, 6])
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .style(theme::input),
         button(text("Save").align_x(Alignment::Center))
             .on_press_maybe((!app.busy).then_some(Message::SaveSet))
             .padding([5, 10])
