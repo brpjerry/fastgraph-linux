@@ -1,6 +1,6 @@
 pkgname=fastgraph
 # Must equal the workspace version in Cargo.toml; the release is tagged v$pkgver.
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Headphone frequency-response measurement for PipeWire, with a Wayland GUI'
 arch=('x86_64')
