@@ -135,16 +135,17 @@ pub fn pan(range: Range, shift: f64, limits: &Limits) -> Option<Range> {
 }
 
 /// The shortest a scroll bar's thumb is drawn, in pixels, so a deep zoom
-/// still leaves something to grab.
+/// still leaves something to grab, on a track at least twice as long.
 pub const MIN_THUMB: f32 = 16.0;
 
 /// The thumb of a scroll bar `length` pixels long over `full`, with `shown`
 /// in view: its start, from the bar's low end, and its length. It is as
-/// long as the share of `full` in view, but at least [`MIN_THUMB`]; a
-/// range beyond `full` puts it on that end.
+/// long as the share of `full` in view, but at least [`MIN_THUMB`] or half
+/// the track, whichever is shorter; a range beyond `full` puts it on that
+/// end.
 pub fn thumb(shown: Range, full: Range, length: f32) -> (f32, f32) {
     let share = (shown.span() / full.span()).clamp(0.0, 1.0) as f32;
-    let size = (share * length).max(MIN_THUMB).min(length);
+    let size = (share * length).max(MIN_THUMB.min(length / 2.0));
     let room = full.span() - shown.span();
     let along = if room > 0.0 {
         ((shown.low - full.low) / room).clamp(0.0, 1.0) as f32
@@ -393,5 +394,20 @@ mod tests {
         let near = Range::new(6.0, 8.5);
         let paged = pan(near, page(near, full, 400.0, 399.0), &limits).unwrap();
         assert_eq!(paged, Range::new(7.5, 10.0));
+    }
+
+    // On a track too short for the least thumb, the thumb takes half of
+    // it, leaving room to page and drag.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_short_track_keeps_room_to_move() {
+        let full = Range::new(0.0, 10.0);
+        let shown = Range::new(0.0, 1.0);
+        let (start, size) = thumb(shown, full, 12.0);
+        assert_eq!((start, size), (0.0, 6.0));
+        assert_eq!(page(shown, full, 12.0, 11.0), 1.0);
+        assert!(thumb_shift(shown, full, 12.0, 3.0) > 0.0);
+        // A longer track keeps the least length.
+        assert_eq!(thumb(shown, full, 100.0).1, MIN_THUMB);
     }
 }

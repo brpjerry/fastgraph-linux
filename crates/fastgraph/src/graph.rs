@@ -308,6 +308,8 @@ pub struct Pan {
     /// positive.
     pub freq: f64,
     pub level: f64,
+    /// The graph's generation when it began: see [`Graph::generation`].
+    pub generation: u64,
 }
 
 /// A scroll bar's axis: the stretch in view, and all there is to see.
@@ -586,6 +588,9 @@ pub struct Graph {
     distortion_note: String,
     /// Each view's zoom, by tab index.
     zooms: [ViewZoom; VIEWS.len()],
+    /// Advanced by a zoom, a reset or a view change, which end any pan
+    /// begun before them.
+    generation: u64,
     cache: Cache,
     /// The live trace's own layer, cleared on every RTA update.
     live_cache: Cache,
@@ -612,6 +617,7 @@ impl Default for Graph {
             drawn_span: Cell::new(0.0),
             distortion_note: NO_DISTORTION.to_string(),
             zooms: Default::default(),
+            generation: 0,
             cache: Cache::new(),
             live_cache: Cache::new(),
             #[cfg(test)]
@@ -627,6 +633,7 @@ impl Graph {
     pub fn set_view(&mut self, view: View) {
         if self.view != view {
             self.view = view;
+            self.advance();
             self.cache.clear();
             self.live_cache.clear();
         }
@@ -730,11 +737,13 @@ impl Graph {
 
     /// Reset view: the current view's axes back to their automatic fit.
     pub fn reset_view(&mut self) {
+        self.advance();
         self.set_zoom(self.view, ViewZoom::default());
     }
 
     /// Every view's axes back to their automatic fit.
     pub fn reset_zoom(&mut self) {
+        self.advance();
         for view in VIEWS.map(|(v, _)| v) {
             self.set_zoom(view, ViewZoom::default());
         }
@@ -742,11 +751,22 @@ impl Graph {
 
     /// `view`'s level axis back to its fit, as when its units change.
     pub fn reset_level(&mut self, view: View) {
+        self.advance();
         let zoom = ViewZoom {
             level: None,
             ..self.zooms[index(view)]
         };
         self.set_zoom(view, zoom);
+    }
+
+    /// End any pan under way: it began on axes since changed.
+    fn advance(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The axes' generation: a pan begun in another is out of date.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn set_zoom(&mut self, view: View, zoom: ViewZoom) {
@@ -767,6 +787,7 @@ impl Graph {
         if wheel.axis == Axis::Level && !self.has_level() {
             return;
         }
+        self.advance();
         let (shown, top) = self.axis(wheel.plot);
         let factor = zoom::factor(wheel.lines);
         let mut zoomed = self.zoom();
@@ -787,15 +808,23 @@ impl Graph {
         self.set_zoom(self.view, zoomed);
     }
 
-    /// Move the zoomed axes the pan began on, from where they were then.
+    /// Move the zoomed axes the pan began on, from where they were then;
+    /// a pan begun before a later zoom, reset or view change is ignored.
+    /// No level move leaves the level where the pan began.
     pub fn pan(&mut self, pan: Pan) {
+        if pan.generation != self.generation {
+            return;
+        }
         let mut zoomed = self.zoom();
         if let Some(range) = pan.from.freq {
             zoomed.freq = zoom::pan(range, pan.freq, &zoom::Limits::frequency());
         }
         if let Some(range) = pan.from.level.filter(|_| self.has_level()) {
-            let limits = self.level_limits(pan.plot);
-            zoomed.level = zoom::pan(range, pan.level, &limits);
+            zoomed.level = if pan.level == 0.0 {
+                Some(range)
+            } else {
+                zoom::pan(range, pan.level, &self.level_limits(pan.plot))
+            };
         }
         self.set_zoom(self.view, zoomed);
     }
@@ -1288,8 +1317,11 @@ struct PlotState {
     hover: Option<Hover>,
     /// A pan under way.
     drag: Option<Drag>,
-    /// The axis whose thumb is under the pointer.
-    lit: Option<Axis>,
+    /// The thumb under the pointer at the last draw.
+    lit: Cell<Option<Axis>>,
+    /// The window lost focus, and the pointer has not moved since: no
+    /// hover is shown.
+    away: bool,
 }
 
 /// A pan under way: where its button went down, and the axes it moves as
@@ -1299,6 +1331,8 @@ struct Drag {
     at: Point,
     from: ViewZoom,
     grip: Grip,
+    /// The graph's generation at the press.
+    generation: u64,
 }
 
 /// What a pan holds.
@@ -1333,12 +1367,22 @@ impl Plot<'_> {
         let graph = self.graph;
         match button {
             mouse::Button::Middle if plot.contains(at.x, at.y) => {
-                let from = graph.zoomed_ranges(plot);
+                let bars = graph.bars(plot);
+                let from = ViewZoom {
+                    freq: bars.freq.map(|bar| bar.shown),
+                    level: bars.level.map(|bar| bar.shown),
+                };
                 if !from.is_zoomed() {
                     return None;
                 }
                 let grip = Grip::Plot(graph.axis(plot).0);
-                state.drag = Some(Drag { at, from, grip });
+                let generation = graph.generation();
+                state.drag = Some(Drag {
+                    at,
+                    from,
+                    grip,
+                    generation,
+                });
                 Some(canvas::Action::request_redraw().and_capture())
             }
             mouse::Button::Left => {
@@ -1348,6 +1392,13 @@ impl Plot<'_> {
                     Axis::Frequency => (bars.freq?, freq_track(&plot).width),
                     Axis::Level => (bars.level?, level_track(&plot).height),
                 };
+                // From where the thumb is drawn: a range held beyond the
+                // full one is drawn on its end.
+                let bar = Bar {
+                    shown: bar.shown.kept_in(bar.full),
+                    ..bar
+                };
+                let generation = graph.generation();
                 let page = zoom::page(bar.shown, bar.full, length, along);
                 let from = match axis {
                     Axis::Frequency => ViewZoom {
@@ -1361,13 +1412,16 @@ impl Plot<'_> {
                 };
                 if page == 0.0 {
                     let grip = Grip::Thumb(axis, bar);
-                    state.drag = Some(Drag { at, from, grip });
+                    state.drag = Some(Drag {
+                        at,
+                        from,
+                        grip,
+                        generation,
+                    });
                     return Some(canvas::Action::request_redraw().and_capture());
                 }
-                Some(
-                    canvas::Action::publish(Event::Pan(pan_by(axis, plot, from, page)))
-                        .and_capture(),
-                )
+                let pan = pan_by(axis, plot, from, page, generation);
+                Some(canvas::Action::publish(Event::Pan(pan)).and_capture())
             }
             _ => None,
         }
@@ -1384,6 +1438,7 @@ impl Plot<'_> {
                     from: drag.from,
                     freq,
                     level,
+                    generation: drag.generation,
                 }
             }
             Grip::Thumb(axis, bar) => {
@@ -1395,14 +1450,37 @@ impl Plot<'_> {
                         zoom::thumb_shift(bar.shown, bar.full, level_track(&plot).height, -dy)
                     }
                 };
-                pan_by(axis, plot, drag.from, shift)
+                pan_by(axis, plot, drag.from, shift, drag.generation)
             }
         }
     }
+
+    /// Whether `drag` still holds on `plot`: nothing has changed the axes
+    /// since its press, and a held thumb's bar is still there.
+    fn holds(&self, drag: &Drag, plot: PlotBox) -> bool {
+        let graph = self.graph;
+        drag.generation == graph.generation()
+            && match drag.grip {
+                Grip::Plot(_) => true,
+                Grip::Thumb(Axis::Frequency, _) => graph.bars(plot).freq.is_some(),
+                Grip::Thumb(Axis::Level, _) => graph.bars(plot).level.is_some(),
+            }
+    }
+}
+
+/// The axis whose thumb on `plot` is under `at`, if any.
+fn thumb_under(plot: &PlotBox, bars: &Bars, at: Option<Point>) -> Option<Axis> {
+    let at = at?;
+    [(Axis::Frequency, bars.freq), (Axis::Level, bars.level)]
+        .into_iter()
+        .find_map(|(axis, bar)| {
+            bar.filter(|bar| thumb_rect(plot, axis, bar).contains(at))
+                .map(|_| axis)
+        })
 }
 
 /// A pan of `axis` alone by `shift`.
-fn pan_by(axis: Axis, plot: PlotBox, from: ViewZoom, shift: f64) -> Pan {
+fn pan_by(axis: Axis, plot: PlotBox, from: ViewZoom, shift: f64, generation: u64) -> Pan {
     let (freq, level) = match axis {
         Axis::Frequency => (shift, 0.0),
         Axis::Level => (0.0, shift),
@@ -1412,6 +1490,7 @@ fn pan_by(axis: Axis, plot: PlotBox, from: ViewZoom, shift: f64) -> Pan {
         from,
         freq,
         level,
+        generation,
     }
 }
 
@@ -1430,7 +1509,20 @@ impl canvas::Program<Event> for Plot<'_> {
         let pointer = cursor
             .position()
             .map(|p| Point::new(p.x - bounds.x, p.y - bounds.y));
+        if state.drag.is_some_and(|drag| !self.holds(&drag, plot)) {
+            state.drag = None;
+        }
+        if let canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
+            state.away = false;
+        }
         match event {
+            // The release may go to another window: the drag ends here.
+            canvas::Event::Window(iced::window::Event::Unfocused) => {
+                state.drag = None;
+                state.away = true;
+                state.hover = Some(Hover::Left);
+                return Some(canvas::Action::publish(Event::Hover(Hover::Left)));
+            }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(button)) if state.drag.is_none() => {
                 return self.press(state, plot, *button, cursor.position_in(bounds)?);
             }
@@ -1476,17 +1568,10 @@ impl canvas::Program<Event> for Plot<'_> {
             }
             _ => Hover::Left,
         };
-        // A thumb lights under the pointer.
-        let bars = self.graph.bars(plot);
-        let lit = cursor.position_in(bounds).and_then(|at| {
-            [(Axis::Frequency, bars.freq), (Axis::Level, bars.level)]
-                .into_iter()
-                .find_map(|(axis, bar)| {
-                    bar.filter(|bar| thumb_rect(&plot, axis, bar).contains(at))
-                        .map(|_| axis)
-                })
-        });
-        let relit = std::mem::replace(&mut state.lit, lit) != lit;
+        // A thumb lights under the pointer: compared with the last draw,
+        // since a page or a pan can move a thumb under a still pointer.
+        let lit = thumb_under(&plot, &self.graph.bars(plot), cursor.position_in(bounds));
+        let relit = state.lit.get() != lit;
         if state.hover == Some(hover) {
             return relit.then(canvas::Action::request_redraw);
         }
@@ -1497,15 +1582,25 @@ impl canvas::Program<Event> for Plot<'_> {
     fn mouse_interaction(
         &self,
         state: &PlotState,
-        _bounds: Rectangle,
-        _cursor: Cursor,
+        bounds: Rectangle,
+        cursor: Cursor,
     ) -> mouse::Interaction {
-        match state.drag {
+        let plot = PlotBox::inside(bounds.width, bounds.height, INSETS);
+        match state.drag.filter(|drag| self.holds(drag, plot)) {
             Some(Drag {
                 grip: Grip::Plot(_),
                 ..
             }) => mouse::Interaction::Grabbing,
-            _ => mouse::Interaction::default(),
+            Some(_) => mouse::Interaction::default(),
+            // Over a plot with an axis to pan.
+            None if cursor
+                .position_in(bounds)
+                .is_some_and(|at| plot.contains(at.x, at.y))
+                && self.graph.bars(plot) != Bars::default() =>
+            {
+                mouse::Interaction::Grab
+            }
+            None => mouse::Interaction::default(),
         }
     }
 
@@ -1525,6 +1620,7 @@ impl canvas::Program<Event> for Plot<'_> {
         // tracked even while another view is up.
         graph.drawn_span.set(plot.span);
         let bars = graph.bars(plot);
+        let drag = state.drag.filter(|drag| self.holds(drag, plot));
         let (plot, top_db) = graph.axis(plot);
         let base = graph.cache.draw(renderer, size, |frame| {
             #[cfg(test)]
@@ -1553,24 +1649,25 @@ impl canvas::Program<Event> for Plot<'_> {
             }
         });
         let mut overlay = Frame::new(renderer, size);
-        let held = match state.drag {
+        let held = match drag {
             Some(Drag {
                 grip: Grip::Thumb(axis, _),
                 ..
             }) => Some(axis),
             _ => None,
         };
-        let pointer = cursor.position_in(bounds);
+        let pointer = cursor.position_in(bounds).filter(|_| !state.away);
+        state.lit.set(thumb_under(&plot, &bars, pointer));
         for (axis, bar) in [(Axis::Frequency, bars.freq), (Axis::Level, bars.level)] {
             let Some(bar) = bar else { continue };
             let thumb = thumb_rect(&plot, axis, &bar);
-            let lit = held == Some(axis)
-                || (held.is_none() && pointer.is_some_and(|at| thumb.contains(at)));
+            let lit = held == Some(axis) || (held.is_none() && state.lit.get() == Some(axis));
             draw_bar(&mut overlay, &plot, axis, thumb, lit, &p);
         }
         // Read the pointer against the axis as drawn now: the published
         // hover may predate an axis move. Headless snapshots have no cursor.
         let hover = match cursor.position() {
+            Some(_) if state.away => None,
             Some(_) => cursor
                 .position_in(bounds)
                 .filter(|at| plot.contains(at.x, at.y))
@@ -1609,7 +1706,7 @@ fn draw_bar(
     let pill =
         |r: Rectangle| Path::rounded_rectangle(r.position(), r.size(), (BAR_WIDTH / 2.0).into());
     frame.fill(&pill(track), p.bg_overlay);
-    frame.fill(&pill(thumb), if lit { p.fg_dim } else { p.fg_faint });
+    frame.fill(&pill(thumb), if lit { p.fg } else { p.fg_dim });
 }
 
 fn label(
@@ -2457,6 +2554,7 @@ fn draw_readout(frame: &mut Frame, plot: &PlotBox, x: f32, readout: String, p: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::Vector;
 
     fn flat(db: f64) -> Trace {
         let freq = vec![10.0, 20.0, 1000.0, 20_000.0, 24_000.0];
@@ -3495,6 +3593,7 @@ mod tests {
                 from: panned.zoomed_ranges(plot),
                 freq,
                 level,
+                generation: panned.generation(),
             });
             let (after, top) = panned.axis(plot);
             let moved = after.freq_at(x + dx);
@@ -3511,6 +3610,7 @@ mod tests {
                 from,
                 freq,
                 level,
+                generation: graph.generation(),
             });
             let (after, _) = graph.axis(plot);
             let end = if edge == plot::F_MAX {
@@ -3566,9 +3666,270 @@ mod tests {
             from: graph.zoomed_ranges(plot),
             freq: 0.3,
             level: -4.0,
+            generation: graph.generation(),
         });
         graph.reset_view();
         assert_eq!(graph.bars(plot), Bars::default());
         assert!(!graph.is_zoomed());
+    }
+
+    /// The 1000×600 canvas of `zoomed_in` given `event` with the pointer at
+    /// `at`: what it publishes, and whether it captures the event.
+    fn on_canvas(
+        graph: &Graph,
+        state: &mut PlotState,
+        event: canvas::Event,
+        at: Point,
+    ) -> (Option<Event>, bool) {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1000.0, 600.0));
+        let plot = Plot { graph, hover: None };
+        let action = canvas::Program::update(&plot, state, &event, bounds, Cursor::Available(at));
+        action.map_or((None, false), |action| {
+            let (message, _, status) = action.into_inner();
+            (message, status == iced::event::Status::Captured)
+        })
+    }
+
+    fn pressed(button: mouse::Button) -> canvas::Event {
+        canvas::Event::Mouse(mouse::Event::ButtonPressed(button))
+    }
+
+    fn released(button: mouse::Button) -> canvas::Event {
+        canvas::Event::Mouse(mouse::Event::ButtonReleased(button))
+    }
+
+    fn moved(to: Point) -> canvas::Event {
+        canvas::Event::Mouse(mouse::Event::CursorMoved { position: to })
+    }
+
+    /// Apply what the canvas published, as the app does.
+    fn apply(graph: &mut Graph, published: Option<Event>) {
+        match published {
+            Some(Event::Pan(pan)) => graph.pan(pan),
+            Some(Event::Wheel(wheel)) => graph.wheel(wheel),
+            _ => {}
+        }
+    }
+
+    /// The level axis as drawn on `plot`: its low and high ends.
+    fn level_shown(graph: &Graph, plot: PlotBox) -> Range {
+        let (shown, top) = graph.axis(plot);
+        Range::new(top - shown.span, top)
+    }
+
+    // A level range held beyond a moved automatic fit is drawn with its
+    // thumb on the track's end; a drag or a page from there moves inward at
+    // once, and a level middle drag leaves the level axis where it is.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_bar_press_starts_where_the_thumb_is_drawn() {
+        let (mut graph, plot) = zoomed_in();
+        // The fit drops 120 dB: the held range is above the new full range.
+        graph.set(vec![flat(-40.0)]);
+        let bar = graph.bars(plot).level.expect("still zoomed in");
+        assert!(bar.shown.low > bar.full.high, "{bar:?}");
+        let thumb = thumb_rect(&plot, Axis::Level, &bar);
+        assert!((thumb.y - plot.top).abs() < 1e-3);
+        // A drag of the thumb 20 px down.
+        let left = mouse::Button::Left;
+        let grab = Point::new(thumb.center_x(), thumb.center_y());
+        let mut state = PlotState::default();
+        let held = graph.zooms;
+        on_canvas(&graph, &mut state, pressed(left), grab);
+        let to = grab + Vector::new(0.0, 20.0);
+        let (published, _) = on_canvas(&graph, &mut state, moved(to), to);
+        on_canvas(&graph, &mut state, released(left), to);
+        apply(&mut graph, published);
+        let moved_to = level_shown(&graph, plot);
+        assert!(
+            moved_to.high < bar.full.high - 1.0,
+            "{moved_to:?} in {bar:?}"
+        );
+        // A click on the track below the thumb pages down from the top end.
+        graph.zooms = held;
+        let below = Point::new(thumb.center_x(), plot.bottom() - 2.0);
+        let (published, _) = on_canvas(&graph, &mut state, pressed(left), below);
+        on_canvas(&graph, &mut state, released(left), below);
+        apply(&mut graph, published);
+        let paged_to = level_shown(&graph, plot);
+        let top = bar.full.high;
+        assert!(
+            (paged_to.high - (top - bar.shown.span())).abs() < 1e-6,
+            "{paged_to:?} in {bar:?}"
+        );
+        graph.zooms = held;
+        // A level middle drag moves the frequency axis alone.
+        let middle = mouse::Button::Middle;
+        let centre = Point::new(plot.left + 400.0, plot.top + 250.0);
+        let before = level_shown(&graph, plot);
+        on_canvas(&graph, &mut state, pressed(middle), centre);
+        let (published, _) = on_canvas(
+            &graph,
+            &mut state,
+            moved(centre + Vector::new(60.0, 0.0)),
+            centre + Vector::new(60.0, 0.0),
+        );
+        on_canvas(&graph, &mut state, released(middle), centre);
+        assert!(matches!(published, Some(Event::Pan(_))), "{published:?}");
+        apply(&mut graph, published);
+        assert_eq!(level_shown(&graph, plot), before);
+    }
+
+    // A wheel zoom, Reset view, Clear or a view change during a drag ends
+    // it: the next move publishes nothing that undoes them, and a pan from
+    // before them is ignored.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_drag_yields_to_a_newer_zoom() {
+        let left = mouse::Button::Left;
+        let middle = mouse::Button::Middle;
+        let centre = Point::new(500.0, 300.0);
+        type Change = fn(&mut Graph, PlotBox);
+        let changes: [(&str, mouse::Button, Change); 5] = [
+            ("wheel on the thumb", left, |graph, plot| {
+                graph.wheel(wheel(Axis::Frequency, plot.left + 500.0, 1.0));
+            }),
+            ("wheel on the plot", middle, |graph, plot| {
+                graph.wheel(wheel(Axis::Level, plot.top + 100.0, 1.0));
+            }),
+            ("Reset view", middle, |graph, _| graph.reset_view()),
+            ("Clear", left, |graph, _| graph.reset_zoom()),
+            ("Phase", middle, |graph, _| graph.set_view(View::Phase)),
+        ];
+        for (name, button, change) in changes {
+            let (mut graph, plot) = zoomed_in();
+            let grab = if button == left {
+                let bar = graph.bars(plot).freq.unwrap();
+                let thumb = thumb_rect(&plot, Axis::Frequency, &bar);
+                Point::new(thumb.center_x(), thumb.center_y())
+            } else {
+                centre
+            };
+            let mut state = PlotState::default();
+            let (_, captured) = on_canvas(&graph, &mut state, pressed(button), grab);
+            assert!(captured, "{name}");
+            let to = grab + Vector::new(30.0, 10.0);
+            let (first, _) = on_canvas(&graph, &mut state, moved(to), to);
+            let Some(Event::Pan(first)) = first else {
+                panic!("{name}: {first:?}");
+            };
+            graph.pan(first);
+            change(&mut graph, plot);
+            let zooms = graph.zooms;
+            let view = graph.view;
+            // A queued pan from before the change.
+            graph.pan(first);
+            assert_eq!(graph.zooms, zooms, "{name}: a stale pan");
+            let to = grab + Vector::new(60.0, 20.0);
+            let (next, _) = on_canvas(&graph, &mut state, moved(to), to);
+            apply(&mut graph, next);
+            on_canvas(&graph, &mut state, released(button), to);
+            assert_eq!(graph.zooms, zooms, "{name}: a later move");
+            assert_eq!(graph.view, view);
+        }
+    }
+
+    // Focus lost mid-drag, the release may go elsewhere: the drag ends and
+    // the readout goes, so a later move pans nothing.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn losing_focus_ends_a_drag() {
+        let (graph, plot) = zoomed_in();
+        let middle = mouse::Button::Middle;
+        let centre = Point::new(plot.left + 400.0, plot.top + 250.0);
+        let mut state = PlotState::default();
+        on_canvas(&graph, &mut state, pressed(middle), centre);
+        let unfocused = canvas::Event::Window(iced::window::Event::Unfocused);
+        let (published, _) = on_canvas(&graph, &mut state, unfocused, centre);
+        assert_eq!(published, Some(Event::Hover(Hover::Left)));
+        let to = centre + Vector::new(40.0, 0.0);
+        let (published, captured) = on_canvas(&graph, &mut state, moved(to), to);
+        assert!(!matches!(published, Some(Event::Pan(_))), "{published:?}");
+        assert!(!captured);
+        // A new press starts a new drag.
+        let (_, captured) = on_canvas(&graph, &mut state, pressed(middle), to);
+        assert!(captured);
+    }
+
+    // The grab cursor over the plot, and the middle press, both follow
+    // whether an axis has somewhere to pan.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn the_cursor_shows_when_the_plot_pans() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1000.0, 600.0));
+        let cursor_at = |graph: &Graph, state: &PlotState, at: Point| {
+            let plot = Plot { graph, hover: None };
+            canvas::Program::mouse_interaction(&plot, state, bounds, Cursor::Available(at))
+        };
+        let (graph, plot) = zoomed_in();
+        let centre = Point::new(plot.left + 400.0, plot.top + 250.0);
+        let margin = Point::new(plot.left - 20.0, plot.top + 250.0);
+        let state = PlotState::default();
+        assert_eq!(cursor_at(&graph, &state, centre), mouse::Interaction::Grab);
+        assert_eq!(
+            cursor_at(&graph, &state, margin),
+            mouse::Interaction::default()
+        );
+        // The level zoomed out to its full range, the frequency at its
+        // default: zoomed, but with nowhere to pan.
+        let mut out = Graph::default();
+        out.set(vec![flat(80.0)]);
+        out.wheel(wheel(Axis::Level, plot.top + 200.0, -60.0));
+        assert!(out.is_zoomed());
+        assert_eq!(out.bars(plot), Bars::default());
+        let mut state = PlotState::default();
+        assert_eq!(
+            cursor_at(&out, &state, centre),
+            mouse::Interaction::default()
+        );
+        let (_, captured) = on_canvas(&out, &mut state, pressed(mouse::Button::Middle), centre);
+        assert!(!captured);
+        assert_eq!(
+            cursor_at(&out, &state, centre),
+            mouse::Interaction::default()
+        );
+    }
+
+    // A page moves the thumb under a still pointer: lit as drawn, it goes
+    // dark again once the pointer leaves it for the bare track.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_paged_thumb_goes_dark_when_the_pointer_leaves_it() {
+        let (mut graph, plot) = zoomed_in();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1000.0, 600.0));
+        let mut state = PlotState::default();
+        // What a draw records: the thumb under the pointer.
+        let drawn = |graph: &Graph, state: &PlotState, at: Point| {
+            state
+                .lit
+                .set(thumb_under(&plot, &graph.bars(plot), Some(at)));
+        };
+        let thumb = thumb_rect(&plot, Axis::Frequency, &graph.bars(plot).freq.unwrap());
+        let at = Point::new(thumb.x + thumb.width + 3.0, thumb.center_y());
+        on_canvas(&graph, &mut state, moved(at), at);
+        drawn(&graph, &state, at);
+        assert_eq!(state.lit.get(), None);
+        let left = mouse::Button::Left;
+        let (published, _) = on_canvas(&graph, &mut state, pressed(left), at);
+        on_canvas(&graph, &mut state, released(left), at);
+        apply(&mut graph, published);
+        drawn(&graph, &state, at);
+        assert_eq!(state.lit.get(), Some(Axis::Frequency));
+        // Back onto the bare track left of the paged thumb.
+        let paged = thumb_rect(&plot, Axis::Frequency, &graph.bars(plot).freq.unwrap());
+        let off = Point::new(paged.x - 3.0, at.y);
+        let canvas = Plot {
+            graph: &graph,
+            hover: None,
+        };
+        let action = canvas::Program::update(
+            &canvas,
+            &mut state,
+            &moved(off),
+            bounds,
+            Cursor::Available(off),
+        );
+        let (_, redraw, _) = action.expect("a redraw").into_inner();
+        assert!(matches!(redraw, iced::window::RedrawRequest::NextFrame));
     }
 }

@@ -1468,6 +1468,7 @@ fn render_snapshots() {
     );
     run(&mut app, wheel(graph::Axis::Level, plot.top + 150.0, 2.0));
     let from = app.graph.zoomed_ranges(plot);
+    let generation = app.graph.generation();
     run(
         &mut app,
         Message::Graph(graph::Event::Pan(graph::Pan {
@@ -1475,6 +1476,7 @@ fn render_snapshots() {
             from,
             freq: 0.4,
             level: -3.0,
+            generation,
         })),
     );
     run(&mut app, hover(1500.0, 80.0));
