@@ -1460,6 +1460,28 @@ fn render_snapshots() {
     run(&mut app, Message::GraphViewSelected(graph::View::Phase));
     run(&mut app, Message::Graph(graph::Event::Reset));
     run(&mut app, Message::GraphViewSelected(graph::View::Response));
+    // Zoomed in and panned on both axes: a scroll bar under the frequency
+    // labels and one right of the plot.
+    run(
+        &mut app,
+        wheel(graph::Axis::Frequency, plot.left + 200.0, 5.0),
+    );
+    run(&mut app, wheel(graph::Axis::Level, plot.top + 150.0, 2.0));
+    let from = app.graph.zoomed_ranges(plot);
+    let generation = app.graph.generation();
+    run(
+        &mut app,
+        Message::Graph(graph::Event::Pan(graph::Pan {
+            plot,
+            from,
+            freq: 0.4,
+            level: -3.0,
+            generation,
+        })),
+    );
+    run(&mut app, hover(1500.0, 80.0));
+    snapshot(&app, "response-zoomed");
+    run(&mut app, Message::Graph(graph::Event::Reset));
 
     run(&mut app, Message::Listen(false));
     run(
@@ -3984,4 +4006,126 @@ fn reset_view_sits_in_the_margin_above_the_plot() {
         (label.x + label.width + 8.0 - plot.right()).abs() < 1.0,
         "{label:?}"
     );
+}
+
+/// The messages the graph alone, in a window of `size`, gives for a press
+/// of `button` at `from`, a move to `to` and a release there.
+fn graph_dragged(
+    app: &App,
+    size: (f32, f32),
+    button: iced::mouse::Button,
+    from: iced::Point,
+    to: iced::Point,
+) -> Vec<Message> {
+    use iced::mouse::Event as Mouse;
+    let view = app.graph.view(None, false).map(Message::Graph);
+    let mut ui = crate::testing::ui(size, view);
+    ui.point_at(from);
+    ui.simulate([iced::Event::Mouse(Mouse::ButtonPressed(button))]);
+    ui.point_at(to);
+    ui.simulate([iced::Event::Mouse(Mouse::CursorMoved { position: to })]);
+    ui.simulate([iced::Event::Mouse(Mouse::ButtonReleased(button))]);
+    ui.messages()
+}
+
+// The scroll bars and middle-drag panning act only on a zoomed axis; a
+// click on a bar's track pages, and Reset view clears the zoom and the pan.
+// Bugs caught: 0, False positives: 0
+#[test]
+fn scroll_bars_appear_when_zoomed_and_reset_view_clears_the_pan() {
+    let mut app = plain(None);
+    let curve = Ok(vec![(PathBuf::from("/in/a.txt"), flat(80.0))]);
+    let clears = app.clears;
+    run(&mut app, Message::Imported(clears, curve));
+    let size = (1000.0, 600.0);
+    let plot = crate::plot::PlotBox::inside(size.0, size.1, graph::INSETS);
+    let shown = |app: &App| app.graph.axis(plot);
+    let default = shown(&app);
+    let pans = |messages: &[Message]| {
+        messages
+            .iter()
+            .filter(|m| matches!(m, Message::Graph(graph::Event::Pan(_))))
+            .count()
+    };
+    let left = iced::mouse::Button::Left;
+    let middle = iced::mouse::Button::Middle;
+    // Where the bars would be: near the right end of the frequency track
+    // and the top of the level one.
+    let freq_track = iced::Point::new(plot.right() - 5.0, size.1 - 5.0);
+    let level_track = iced::Point::new(plot.right() + 8.0, plot.top + 5.0);
+    let centre = iced::Point::new(plot.left + plot.width / 2.0, plot.top + plot.height / 2.0);
+    let off = iced::Point::new(centre.x + 100.0, centre.y + 50.0);
+    // Unzoomed: no bars to press, nothing for a middle drag to move.
+    assert_eq!(app.graph.bars(plot), graph::Bars::default());
+    for at in [freq_track, level_track] {
+        assert_eq!(pans(&graph_dragged(&app, size, left, at, at)), 0);
+    }
+    assert_eq!(pans(&graph_dragged(&app, size, middle, centre, off)), 0);
+    // Zoomed in on frequency near 20 Hz: its bar alone, and a click on its
+    // track's far end pages up by one span.
+    run(
+        &mut app,
+        Message::Graph(graph::Event::Wheel(graph::Wheel {
+            axis: graph::Axis::Frequency,
+            plot,
+            at: plot.left + 10.0,
+            lines: 6.0,
+        })),
+    );
+    let bars = app.graph.bars(plot);
+    let before = bars.freq.expect("a frequency bar once zoomed").shown;
+    assert_eq!(bars.level, None);
+    assert_eq!(
+        pans(&graph_dragged(&app, size, left, level_track, level_track)),
+        0
+    );
+    let paged = graph_dragged(&app, size, left, freq_track, freq_track);
+    assert_eq!(pans(&paged), 1, "{paged:?}");
+    for message in paged {
+        run(&mut app, message);
+    }
+    let after = app.graph.bars(plot).freq.unwrap().shown;
+    assert!(
+        (after.low - before.high).abs() < 1e-9,
+        "{before:?} -> {after:?}"
+    );
+    // Zoomed in on the level too: its bar takes a click.
+    run(
+        &mut app,
+        Message::Graph(graph::Event::Wheel(graph::Wheel {
+            axis: graph::Axis::Level,
+            plot,
+            at: centre.y,
+            lines: 3.0,
+        })),
+    );
+    let level = app
+        .graph
+        .bars(plot)
+        .level
+        .expect("a level bar once zoomed")
+        .shown;
+    let paged = graph_dragged(&app, size, left, level_track, level_track);
+    assert_eq!(pans(&paged), 1, "{paged:?}");
+    for message in paged {
+        run(&mut app, message);
+    }
+    assert!(app.graph.bars(plot).level.unwrap().shown.low > level.low);
+    // A middle drag pans both axes.
+    let zoomed = shown(&app);
+    let dragged = graph_dragged(&app, size, middle, centre, off);
+    assert!(pans(&dragged) > 0, "{dragged:?}");
+    for message in dragged {
+        run(&mut app, message);
+    }
+    let panned = shown(&app);
+    assert!(panned.0.f_low < zoomed.0.f_low && panned.1 > zoomed.1);
+    // Reset view clears the zoom and the pan, and the bars with them.
+    let clicked = reset_view_clicked(&app).expect("Reset view offered once zoomed");
+    for message in clicked {
+        run(&mut app, message);
+    }
+    assert_eq!(shown(&app), default);
+    assert_eq!(app.graph.bars(plot), graph::Bars::default());
+    assert!(reset_view_clicked(&app).is_none());
 }

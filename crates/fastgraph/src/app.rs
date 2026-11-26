@@ -829,6 +829,7 @@ impl App {
             Message::Graph(graph::Event::Hover(graph::Hover::Left)) => self.hover = None,
             Message::Graph(graph::Event::Wheel(wheel)) => self.graph.wheel(wheel),
             Message::Graph(graph::Event::Reset) => self.graph.reset_view(),
+            Message::Graph(graph::Event::Pan(pan)) => self.graph.pan(pan),
             Message::FirstFrame => return iced::exit(),
             Message::Frame(at) => self.now = at,
             Message::Reconnect => match self.connect() {
