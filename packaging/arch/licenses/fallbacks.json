@@ -1,0 +1,99 @@
+{
+  "cookie-factory-0.3.3": [
+    "cookie-factory/MIT.txt"
+  ],
+  "gpu-alloc-0.6.2": [
+    "gpu-alloc/COPYING",
+    "gpu-alloc/license/APACHE",
+    "gpu-alloc/license/MIT"
+  ],
+  "gpu-alloc-types-0.3.1": [
+    "gpu-alloc/COPYING",
+    "gpu-alloc/license/APACHE",
+    "gpu-alloc/license/MIT"
+  ],
+  "gpu-descriptor-0.3.2": [
+    "gpu-descriptor/COPYING",
+    "gpu-descriptor/license/APACHE",
+    "gpu-descriptor/license/MIT"
+  ],
+  "gpu-descriptor-types-0.2.0": [
+    "gpu-descriptor/COPYING",
+    "gpu-descriptor/license/APACHE",
+    "gpu-descriptor/license/MIT"
+  ],
+  "hexf-parse-0.2.1": [
+    "hexf/CC0-1.0.txt"
+  ],
+  "iced_core-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_debug-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_futures-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_graphics-0.14.0": [
+    "iced/LICENSE",
+    "iced/FiraSans-OFL.txt",
+    "iced/Iced-Icons-OFL.txt"
+  ],
+  "iced_program-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_renderer-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_runtime-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_selector-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_wgpu-0.14.0": [
+    "iced/LICENSE"
+  ],
+  "iced_tiny_skia-0.14.1": [
+    "iced/LICENSE"
+  ],
+  "iced_widget-0.14.2": [
+    "iced/LICENSE"
+  ],
+  "iced_winit-0.14.1": [
+    "iced/LICENSE"
+  ],
+  "lyon-1.0.19": [
+    "lyon/LICENSE-APACHE",
+    "lyon/LICENSE-MIT"
+  ],
+  "lyon_algorithms-1.0.22": [
+    "lyon/LICENSE-APACHE",
+    "lyon/LICENSE-MIT"
+  ],
+  "lyon_geom-1.0.20": [
+    "lyon/LICENSE-APACHE",
+    "lyon/LICENSE-MIT"
+  ],
+  "lyon_path-1.0.19": [
+    "lyon/LICENSE-APACHE",
+    "lyon/LICENSE-MIT"
+  ],
+  "lyon_tessellation-1.0.23": [
+    "lyon/LICENSE-APACHE",
+    "lyon/LICENSE-MIT"
+  ],
+  "profiling-1.0.18": [
+    "profiling/LICENSE-APACHE",
+    "profiling/LICENSE-MIT"
+  ],
+  "sctk-adwaita-0.10.1": [
+    "sctk-adwaita/Cantarell-OFL.txt"
+  ],
+  "spirv-0.3.0+sdk-1.3.268.0": [
+    "rspirv/LICENSE"
+  ],
+  "svg_fmt-0.4.5": [
+    "rust_debug/LICENSE"
+  ]
+}

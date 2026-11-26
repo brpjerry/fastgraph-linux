@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=fastgraph
+GenericName=Frequency Response Analyzer
+Comment=Measure headphone frequency response with PipeWire
+Exec=fastgraph
+Icon=fastgraph
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=headphones;measurement;frequency;response;sweep;RTA;REW;
+StartupWMClass=fastgraph

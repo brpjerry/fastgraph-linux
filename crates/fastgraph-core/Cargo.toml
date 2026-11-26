@@ -1,0 +1,15 @@
+[package]
+name = "fastgraph-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+hound = "3"
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+realfft = "3"
+serde = { version = "1", features = ["derive"] }
+tar = { version = "0.4", default-features = false }
+tempfile = "3"
+toml = "1"

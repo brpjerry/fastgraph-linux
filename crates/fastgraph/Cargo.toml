@@ -1,0 +1,18 @@
+[package]
+name = "fastgraph"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+fastgraph-core = { path = "../fastgraph-core" }
+# Wayland only: no `x11` feature.
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "wayland", "canvas", "thread-pool", "fira-sans", "crisp", "selector", "advanced"] }
+# xdg-desktop-portal dialogs; no GTK.
+rfd = "0.18"
+
+[dev-dependencies]
+iced_test = "0.14"
+tempfile = "3"
+# Runs the tasks `App::update` returns (`app_tests::run`).
+iced_runtime = "0.14"

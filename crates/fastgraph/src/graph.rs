@@ -1,0 +1,2252 @@
+//! The response graph: the shown measurements on a 20 Hz–20 kHz log grid
+//! with a dB axis topped by the loudest trace and scaled to the plot's shape.
+//! Its Phase view plots their phase instead, unwrapped when it all fits 720° and wrapped to
+//! ±180° otherwise, and its Distortion view
+//! the harmonics, THD and noise floor of one measurement in % or on a dB axis that holds them
+//! all.
+//!
+//! As in fastpeq-gui's graph, the grid and the traces are cached and redrawn
+//! only when what they show ([`Graph::set`]) or the canvas size changes; the
+//! hover crosshair and readout are drawn every frame on their own layer.
+use crate::plot::{self, Insets, PlotBox, Tick};
+use crate::theme::{self, Palette};
+use fastgraph_core::response::Response;
+use iced::advanced::mouse::{self, Cursor};
+use iced::alignment::Vertical;
+use iced::widget::canvas::{self, Cache, Frame, Geometry, Path, Stroke, Text};
+use iced::widget::text::Alignment;
+use iced::widget::{Canvas, container, stack, text};
+use iced::{Element, Length, Point, Rectangle, Renderer, Size, Theme};
+use std::borrow::Cow;
+use std::cell::Cell;
+
+/// Shown on an empty graph.
+pub const EMPTY: &str = "No measurements yet — Measure, Listen, or Import";
+/// Shown on an empty graph while the list has measurements, all hidden.
+pub const ALL_HIDDEN: &str = "Show a measurement, or use Measure, Listen, or Import";
+
+/// The most dB the plot shape alone requests for the Distortion view.
+const MAX_DB_SPAN: f64 = 160.0;
+
+/// Room for the axis labels.
+const INSETS: Insets = Insets {
+    left: 44.0,
+    right: 16.0,
+    top: 16.0,
+    bottom: 26.0,
+};
+/// Degrees between horizontal phase lines, and between the brighter ones,
+/// labelled unless the plot is too short for that.
+const PHASE_LINES: f64 = 45.0;
+const PHASE_MAJORS: f64 = 90.0;
+/// The wrapped phase axis runs from +180° at the top to −180° at the bottom.
+const PHASE_TOP: f64 = 180.0;
+const PHASE_SPAN: f64 = 360.0;
+/// The widest range of unwrapped phase drawn unwrapped; wider, the view
+/// wraps it.
+const MAX_UNWRAPPED_SPAN: f64 = 720.0;
+/// The unwrapped axis's ends are on multiples of this.
+const PHASE_AXIS_STEP: f64 = 90.0;
+/// The frequency an unwrapped trace is anchored at: its phase there is in
+/// (−180°, 180°].
+const PHASE_ANCHOR_HZ: f64 = 1000.0;
+/// dB between horizontal grid lines, and between labelled ones.
+const DB_LINES: f64 = 5.0;
+const DB_LABELS: f64 = 10.0;
+const LABEL_SIZE: f32 = 11.0;
+/// The least room between two stacked axis labels' lines.
+const LABEL_ROOM: f32 = 2.2 * LABEL_SIZE;
+const TRACE_WIDTH: f32 = 1.5;
+
+/// What the graph plots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    #[default]
+    Response,
+    Phase,
+    Distortion,
+}
+
+/// The graph's tabs.
+pub const VIEWS: [(View, &str); 3] = [
+    (View::Response, "Response"),
+    (View::Phase, "Phase"),
+    (View::Distortion, "Distortion"),
+];
+
+/// The tab index of `view`.
+pub fn index(view: View) -> usize {
+    VIEWS.iter().position(|&(v, _)| v == view).unwrap_or(0)
+}
+
+/// Shown in the Distortion view when no shown measurement has distortion data.
+pub const NO_DISTORTION: &str = "Distortion needs a sweep measured with this version";
+
+/// The Distortion view's units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Units {
+    /// Percent of the fundamental, on a log axis.
+    #[default]
+    Percent,
+    /// Absolute levels on the dB axis.
+    Db,
+}
+
+/// The units toggle's segments.
+pub const UNITS: [(Units, &str); 2] = [(Units::Percent, "%"), (Units::Db, "dB")];
+
+/// The percent axis runs from 100 % (2 decades) at the top, 4 decades down
+/// to 0.01 % at the bottom.
+const PCT_TOP: f64 = 2.0;
+const PCT_SPAN: f64 = 4.0;
+/// The line width of the THD curve, and the room between curve labels.
+const THD_WIDTH: f32 = 2.5;
+const LABEL_GAP: f32 = LABEL_SIZE + 2.0;
+
+/// The y of `percent` on the percent axis of `plot`: its decades from
+/// 0.01 % (the bottom edge) to 100 % (the top one), values beyond pinned.
+fn percent_y(plot: &PlotBox, percent: f64) -> f32 {
+    let axis = PlotBox {
+        span: PCT_SPAN,
+        ..*plot
+    };
+    axis.y_of(percent_axis(percent), PCT_TOP)
+        .clamp(plot.top, plot.bottom())
+}
+
+/// A percentage as its place on the percent axis: its decade. `NaN` (a
+/// gap) stays `NaN`; zero is clamped to a tiny value.
+fn percent_axis(percent: f64) -> f64 {
+    if percent.is_nan() {
+        return percent;
+    }
+    percent.max(1e-12).log10()
+}
+
+/// What colour a distortion curve takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ink {
+    /// A measurement trace colour.
+    Trace(usize),
+    /// The foreground colour.
+    Fg,
+    /// The dim foreground.
+    Dim,
+}
+
+/// One curve of the Distortion view over the response grid.
+#[derive(Debug, Clone)]
+pub struct Curve {
+    pub label: String,
+    pub ink: Ink,
+    pub dashed: bool,
+    pub thick: bool,
+    /// Whether its name is written at its right end.
+    pub labelled: bool,
+    pub freq: Vec<f64>,
+    /// Its place on the axis of the view's units: dB, or the decade of the
+    /// percentage. `NaN` where it has no data.
+    pub y: Vec<f64>,
+}
+
+impl Curve {
+    /// A curve of `level` re `fundamental` (on the same grid) in `units`.
+    pub fn new(
+        label: &str,
+        ink: Ink,
+        level: &Response,
+        fundamental: &Response,
+        units: Units,
+    ) -> Curve {
+        let y = match units {
+            Units::Db => level.db.clone(),
+            Units::Percent => fastgraph_core::distortion::percent_of(level, fundamental)
+                .into_iter()
+                .map(percent_axis)
+                .collect(),
+        };
+        Curve {
+            label: label.into(),
+            ink,
+            dashed: false,
+            thick: false,
+            labelled: false,
+            freq: level.freq.clone(),
+            y,
+        }
+    }
+
+    /// The place on the axis at `f`, interpolated in log f; `NaN` outside
+    /// the data or beside a gap.
+    fn at(&self, f: f64) -> f64 {
+        let (Some(&first), Some(&last)) = (self.freq.first(), self.freq.last()) else {
+            return f64::NAN;
+        };
+        if !(first..=last).contains(&f) {
+            return f64::NAN;
+        }
+        let hi = self.freq.partition_point(|x| *x < f);
+        if self.freq[hi] == f || hi == 0 {
+            return self.y[hi];
+        }
+        let (a, b) = (self.y[hi - 1], self.y[hi]);
+        let t = (f / self.freq[hi - 1]).ln() / (self.freq[hi] / self.freq[hi - 1]).ln();
+        a + t * (b - a)
+    }
+
+    /// The points inside the plotted decades.
+    pub(crate) fn plotted(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.freq
+            .iter()
+            .zip(&self.y)
+            .filter(|(f, _)| (plot::F_MIN..=plot::F_MAX).contains(*f))
+            .map(|(f, y)| (*f, *y))
+    }
+}
+
+/// What the Distortion view shows: the curves of one measurement.
+#[derive(Debug, Clone)]
+pub struct DistortionPlot {
+    /// The measurement's name.
+    pub name: String,
+    pub units: Units,
+    pub curves: Vec<Curve>,
+}
+
+impl DistortionPlot {
+    /// A level on the axis, as the readout writes it: "0.042 %", "-52.1 dB".
+    fn reading(&self, y: f64) -> String {
+        match self.units {
+            Units::Db => format!("{y:+.1} dB"),
+            Units::Percent => {
+                let pct = 10f64.powf(y);
+                match pct {
+                    p if p >= 10.0 => format!("{p:.1} %"),
+                    p if p >= 1.0 => format!("{p:.2} %"),
+                    p if p >= 0.001 => format!("{p:.3} %"),
+                    p => format!("{p:.1e} %"),
+                }
+            }
+        }
+    }
+
+    /// The curve closest in level to `y` at `freq`, with its place there.
+    fn nearest(&self, freq: f64, y: f64) -> Option<(&Curve, f64)> {
+        self.curves
+            .iter()
+            .filter_map(|c| {
+                let at = c.at(freq);
+                at.is_finite().then_some((c, at))
+            })
+            .min_by(|a, b| (a.1 - y).abs().total_cmp(&(b.1 - y).abs()))
+    }
+}
+
+/// The note for shown traces the Phase view cannot draw.
+pub fn no_phase_note(n: usize) -> String {
+    match n {
+        1 => "1 shown trace has no phase".into(),
+        n => format!("{n} shown traces have no phase"),
+    }
+}
+
+/// Where the pointer is over the plot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hover {
+    /// The frequency and level under the pointer.
+    At {
+        freq: f64,
+        db: f64,
+    },
+    Left,
+}
+
+/// One shown measurement: its display response and colour index.
+#[derive(Debug, Clone)]
+pub struct Trace {
+    /// The measurement's name; `Graph::set` turns it into the hover readout's
+    /// display name (one line, cut short), so it is prepared once per rebuild.
+    pub name: String,
+    pub response: Response,
+    pub color: usize,
+}
+
+/// One shown measurement's phase in degrees (wrapped to ±180°) over `freq`.
+#[derive(Debug, Clone)]
+pub struct PhaseTrace {
+    pub freq: Vec<f64>,
+    pub deg: Vec<f64>,
+    pub color: usize,
+}
+
+impl PhaseTrace {
+    /// The phase at `f`: a point's own, else interpolated in log f along the
+    /// short arc the line is drawn on, wrapped back to (-180, 180]. `NaN`
+    /// outside the data or beside a gap.
+    fn at(&self, f: f64) -> f64 {
+        let (Some(&first), Some(&last)) = (self.freq.first(), self.freq.last()) else {
+            return f64::NAN;
+        };
+        if !(first..=last).contains(&f) {
+            return f64::NAN;
+        }
+        let hi = self.freq.partition_point(|x| *x < f);
+        if self.freq[hi] == f {
+            return self.deg[hi];
+        }
+        let (a, b) = (self.deg[hi - 1], self.deg[hi]);
+        let t = (f / self.freq[hi - 1]).ln() / (self.freq[hi] / self.freq[hi - 1]).ln();
+        let delta = b - a;
+        if delta.abs() <= 180.0 {
+            return a + t * delta;
+        }
+        let phase = a + t * (delta - 360.0 * delta.signum());
+        if phase.abs() > 180.0 || phase == -180.0 {
+            phase - 360.0 * phase.signum()
+        } else {
+            phase
+        }
+    }
+
+    /// The points inside the plotted decades, with the values at the two
+    /// ends.
+    fn plotted(&self) -> Vec<(f64, f64)> {
+        let inside = self
+            .freq
+            .iter()
+            .zip(&self.deg)
+            .filter(|(f, _)| plot::F_MIN < **f && **f < plot::F_MAX)
+            .map(|(f, d)| (*f, *d));
+        std::iter::once((plot::F_MIN, self.at(plot::F_MIN)))
+            .chain(inside)
+            .chain(std::iter::once((plot::F_MAX, self.at(plot::F_MAX))))
+            .collect()
+    }
+}
+
+/// `points` cut into the runs that can be joined by a line: a break at
+/// every gap (`NaN`) and wherever the phase jumps by more than 180°, which
+/// is a wrap, not a swing. At a wrap the run ending runs on to the ±180°
+/// edge it crosses and the next starts on the opposite edge, at the
+/// crossing's frequency (interpolated in log f on the unwrapped line), so
+/// the trace has no gap there and no point is left alone.
+fn phase_segments(points: &[(f64, f64)]) -> Vec<Vec<(f64, f64)>> {
+    let mut runs: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut last: Option<(f64, f64)> = None;
+    for &(f, deg) in points {
+        if !deg.is_finite() {
+            last = None;
+            continue;
+        }
+        match (last, runs.last_mut()) {
+            (Some((_, before)), Some(run)) if (deg - before).abs() <= 180.0 => run.push((f, deg)),
+            (Some((f0, before)), Some(run)) => {
+                // Up through +180°, or down through −180°.
+                let (edge, unwrapped) = if before > 0.0 {
+                    (180.0, deg + 360.0)
+                } else {
+                    (-180.0, deg - 360.0)
+                };
+                let t = (edge - before) / (unwrapped - before);
+                let crossing = f0 * (f / f0).powf(t);
+                run.push((crossing, edge));
+                runs.push(vec![(crossing, -edge), (f, deg)]);
+            }
+            _ => runs.push(vec![(f, deg)]),
+        }
+        last = Some((f, deg));
+    }
+    runs
+}
+
+/// The phase trace closest in degrees to `deg` at `freq`, with its phase
+/// there; around the wrap when the traces are `wrapped`.
+fn nearest_phase(
+    traces: &[PhaseTrace],
+    freq: f64,
+    deg: f64,
+    wrapped: bool,
+) -> Option<(&PhaseTrace, f64)> {
+    let gap = |at: f64| {
+        if wrapped {
+            circular_gap(at, deg)
+        } else {
+            (at - deg).abs()
+        }
+    };
+    traces
+        .iter()
+        .filter_map(|t| {
+            let at = t.at(freq);
+            at.is_finite().then_some((t, at))
+        })
+        .min_by(|a, b| gap(a.1).total_cmp(&gap(b.1)))
+}
+
+/// The angle between two phases, wrap included: 179° and −179° are 2° apart.
+fn circular_gap(a: f64, b: f64) -> f64 {
+    (((a - b + 540.0) % 360.0) - 180.0).abs()
+}
+
+/// `deg` (wrapped, over `freq`) made continuous: a point more than 180° from
+/// the finite point before it, across gaps (`NaN`, kept) too, moves by whole
+/// turns to lie within 180° of it; an exact half-turn stays put. The whole curve then moves by whole turns so that its
+/// point nearest 1 kHz lies in (−180°, 180°].
+pub fn unwrap_phase(freq: &[f64], deg: &[f64]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(deg.len());
+    let mut last: Option<f64> = None;
+    for &d in deg {
+        if !d.is_finite() {
+            out.push(f64::NAN);
+            continue;
+        }
+        let at = match last {
+            Some(before) if (d - before).abs() > 180.0 => {
+                d - 360.0 * ((d - before) / 360.0).round()
+            }
+            _ => d,
+        };
+        out.push(at);
+        last = Some(at);
+    }
+    let anchor = freq
+        .iter()
+        .zip(&out)
+        .filter(|(_, d)| d.is_finite())
+        .min_by(|a, b| {
+            let off = |f: f64| (f / PHASE_ANCHOR_HZ).ln().abs();
+            off(*a.0).total_cmp(&off(*b.0))
+        })
+        .map(|(_, d)| *d);
+    if let Some(anchor) = anchor {
+        // The turns that bring the anchor into (−180, 180].
+        let turns = -((anchor - 180.0) / 360.0).ceil();
+        for d in &mut out {
+            *d += 360.0 * turns;
+        }
+    }
+    out
+}
+
+/// How the Phase view draws phase.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PhaseAxis {
+    /// Wrapped to ±180°, broken at the wraps.
+    Wrapped,
+    /// Unwrapped, on an axis from `top` down `span` degrees.
+    Unwrapped { top: f64, span: f64 },
+}
+
+impl PhaseAxis {
+    /// The axis for these unwrapped traces: unwrapped when they all fit
+    /// [`MAX_UNWRAPPED_SPAN`], on 90° multiples at least 360° apart.
+    fn of(unwrapped: &[PhaseTrace]) -> Self {
+        let Some((low, high)) = unwrapped
+            .iter()
+            .flat_map(|t| t.deg.iter().copied())
+            .filter(|d| d.is_finite())
+            .map(|d| (d, d))
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+        else {
+            return Self::Wrapped;
+        };
+        if high - low > MAX_UNWRAPPED_SPAN {
+            return Self::Wrapped;
+        }
+        let bottom = (low / PHASE_AXIS_STEP).floor() * PHASE_AXIS_STEP;
+        let top = (high / PHASE_AXIS_STEP).ceil() * PHASE_AXIS_STEP;
+        // Short ranges grow to a turn about their middle, in whole 90° steps.
+        let span = (top - bottom).max(PHASE_SPAN);
+        let steps = ((span - (top - bottom)) / PHASE_AXIS_STEP / 2.0).floor();
+        Self::Unwrapped {
+            top: top + steps * PHASE_AXIS_STEP,
+            span,
+        }
+    }
+
+    /// The degrees at the axis's top, and its span.
+    fn range(self) -> (f64, f64) {
+        match self {
+            Self::Wrapped => (PHASE_TOP, PHASE_SPAN),
+            Self::Unwrapped { top, span } => (top, span),
+        }
+    }
+
+    /// The caption naming the mode.
+    pub fn caption(self) -> &'static str {
+        match self {
+            Self::Wrapped => "Phase · wrapped",
+            Self::Unwrapped { .. } => "Phase · unwrapped",
+        }
+    }
+}
+
+/// `trace` over the plotted decades, unwrapped.
+fn unwrapped(trace: &PhaseTrace) -> PhaseTrace {
+    let (freq, deg): (Vec<f64>, Vec<f64>) = trace.plotted().into_iter().unzip();
+    let deg = unwrap_phase(&freq, &deg);
+    PhaseTrace {
+        freq,
+        deg,
+        color: trace.color,
+    }
+}
+
+/// What the graph shows, and its cached layer.
+pub struct Graph {
+    view: View,
+    traces: Vec<Trace>,
+    /// The Phase view's traces, and how many shown measurements it cannot
+    /// draw for lack of phase.
+    phase: Vec<PhaseTrace>,
+    no_phase: usize,
+    /// The phase traces unwrapped over the plotted decades, and how the
+    /// view draws them.
+    unwrapped: Vec<PhaseTrace>,
+    phase_axis: PhaseAxis,
+    /// The Distortion view's curves, if a shown measurement has any.
+    distortion: Option<DistortionPlot>,
+    /// The RTA's running average, dashed in the foreground colour.
+    live: Option<Response>,
+    /// The quietest and loudest levels shown, within the plotted decades.
+    extent: Option<(f64, f64)>,
+    /// The dB span of the last draw, so an update can tell whether it moves
+    /// the axis as drawn.
+    drawn_span: Cell<f64>,
+    /// What the Distortion view says when it has no curves.
+    distortion_note: String,
+    cache: Cache,
+    /// The live trace's own layer, cleared on every RTA update.
+    live_cache: Cache,
+    /// How many times the cached layer was drawn.
+    #[cfg(test)]
+    pub(crate) drawn: Cell<usize>,
+}
+
+impl Default for Graph {
+    fn default() -> Self {
+        Self {
+            view: View::Response,
+            traces: Vec::new(),
+            phase: Vec::new(),
+            no_phase: 0,
+            unwrapped: Vec::new(),
+            phase_axis: PhaseAxis::Wrapped,
+            distortion: None,
+            live: None,
+            extent: None,
+            drawn_span: Cell::new(0.0),
+            distortion_note: NO_DISTORTION.to_string(),
+            cache: Cache::new(),
+            live_cache: Cache::new(),
+            #[cfg(test)]
+            drawn: Cell::new(0),
+        }
+    }
+}
+
+impl Graph {
+    /// Switch the view, redrawing the cached layer.
+    pub fn set_view(&mut self, view: View) {
+        if self.view != view {
+            self.view = view;
+            self.cache.clear();
+            self.live_cache.clear();
+        }
+    }
+
+    /// Show these phase traces, with the number of shown measurements left
+    /// out for lack of phase.
+    pub fn set_phase(&mut self, traces: Vec<PhaseTrace>, no_phase: usize) {
+        self.unwrapped = traces.iter().map(unwrapped).collect();
+        self.phase_axis = PhaseAxis::of(&self.unwrapped);
+        self.phase = traces;
+        self.no_phase = no_phase;
+        self.cache.clear();
+    }
+
+    /// Show these distortion curves (or none), rescaling the dB axis to them.
+    pub fn set_distortion(&mut self, plot: Option<DistortionPlot>) {
+        self.distortion = plot;
+        self.rescale();
+        self.cache.clear();
+    }
+
+    /// Set what the Distortion view says when it has no curves.
+    pub fn set_distortion_note(&mut self, note: String) {
+        self.distortion_note = note;
+    }
+
+    /// The labels of the distortion curves.
+    #[cfg(test)]
+    pub fn curve_labels(&self) -> Vec<String> {
+        self.distortion
+            .iter()
+            .flat_map(|d| d.curves.iter().map(|c| c.label.clone()))
+            .collect()
+    }
+
+    /// The phase traces as drawn, and whether they are wrapped.
+    fn phase_shown(&self) -> (&[PhaseTrace], bool) {
+        match self.phase_axis {
+            PhaseAxis::Wrapped => (&self.phase, true),
+            PhaseAxis::Unwrapped { .. } => (&self.unwrapped, false),
+        }
+    }
+
+    /// How many response traces are set.
+    #[cfg(test)]
+    pub fn trace_count(&self) -> usize {
+        self.traces.len()
+    }
+
+    /// How many phase traces are set.
+    #[cfg(test)]
+    pub fn phase_count(&self) -> usize {
+        self.phase.len()
+    }
+
+    /// The plot with its vertical axis as this view draws it, and the value
+    /// at its top: dB, or degrees (wrapped ±180° or the unwrapped fit).
+    fn axis(&self, plot: PlotBox) -> (PlotBox, f64) {
+        match self.view {
+            View::Phase => {
+                let (top, span) = self.phase_axis.range();
+                (PlotBox { span, ..plot }, top)
+            }
+            View::Distortion if self.units() == Units::Percent => (
+                PlotBox {
+                    span: PCT_SPAN,
+                    ..plot
+                },
+                PCT_TOP,
+            ),
+            View::Distortion => {
+                let (span, top) = self.distortion_db_axis(plot.span);
+                (PlotBox { span, ..plot }, top)
+            }
+            View::Response => (plot, self.top_db(plot.span)),
+        }
+    }
+
+    /// The Distortion view's dB span and top for a plot whose shape gives
+    /// `shape_span`: the top is the loudest level rounded up to 10 dB plus
+    /// 5 dB of headroom, and the span grows to hold the quietest curve,
+    /// since the fundamental and the noise floor lie far apart.
+    fn distortion_db_axis(&self, shape_span: f64) -> (f64, f64) {
+        let Some((quiet, loud)) = self.extent else {
+            return (shape_span, self.top_db(shape_span));
+        };
+        let top = (loud / 10.0).ceil() * 10.0 + 5.0;
+        let span = shape_span.min(MAX_DB_SPAN).max(top - quiet + 10.0);
+        (span, top)
+    }
+
+    /// The Distortion view's units.
+    fn units(&self) -> Units {
+        self.distortion.as_ref().map_or(Units::Percent, |d| d.units)
+    }
+
+    /// Show `traces`, rescaling the dB axis to them.
+    pub fn set(&mut self, mut traces: Vec<Trace>) {
+        for t in &mut traces {
+            t.name = readout_name(&t.name);
+        }
+        self.traces = traces;
+        self.rescale();
+        self.cache.clear();
+    }
+
+    /// The colours changed: redraw the traces in the new ones.
+    pub fn colors_changed(&self) {
+        self.cache.clear();
+    }
+
+    /// Show the RTA's average (or none). Only the live layer is redrawn,
+    /// unless the dB axis moves with it.
+    pub fn set_live(&mut self, live: Option<Response>) {
+        self.live = live;
+        self.live_cache.clear();
+        if self.rescale() {
+            self.cache.clear();
+        }
+    }
+
+    /// Fit the dB axis to what is shown; whether its top moved at the span
+    /// last drawn (a new size redraws anyway).
+    fn rescale(&mut self) -> bool {
+        let span = self.drawn_span.get();
+        let before = self.top_db(span);
+        // The distortion curves set the dB axis only in dB.
+        let curves = self
+            .distortion
+            .iter()
+            .filter(|d| d.units == Units::Db)
+            .flat_map(|d| &d.curves)
+            .filter_map(|c| {
+                c.plotted()
+                    .map(|(_, y)| y)
+                    .filter(|y| y.is_finite())
+                    .map(|y| (y, y))
+                    .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+            });
+        self.extent = self
+            .traces
+            .iter()
+            .map(|t| &t.response)
+            // The live trace is drawn in the Response view only.
+            .chain(self.live.as_ref().filter(|_| self.view == View::Response))
+            .filter_map(extent_of)
+            .chain(curves)
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
+        self.top_db(span) != before
+    }
+
+    /// The top of a `span` dB axis: what is shown sits centred (to the
+    /// nearest step) when it fits with room to spare, else the loudest level
+    /// sits just under the top, or mid-plot when the plot is too short for
+    /// the headroom.
+    pub fn top_db(&self, span: f64) -> f64 {
+        let Some((quiet, loud)) = self.extent else {
+            return plot::top_db(None);
+        };
+        let pinned = plot::top_db(Some(loud));
+        if pinned - span <= quiet - plot::HEADROOM_DB {
+            ((quiet + loud + span) / 2.0 / plot::HEADROOM_DB).round() * plot::HEADROOM_DB
+        } else {
+            pinned.min(loud + span / 2.0)
+        }
+    }
+
+    /// The canvas, with a note over it when there is something to say;
+    /// `rows`: the list has measurements.
+    pub fn view(&self, hover: Option<(f64, f64)>, rows: bool) -> Element<'_, Hover> {
+        let canvas = Canvas::new(Plot { graph: self, hover })
+            .width(Length::Fill)
+            .height(Length::Fill);
+        if let (View::Distortion, Some(d)) = (self.view, &self.distortion) {
+            // Which measurement it is.
+            return stack![canvas, corner_caption(format!("Distortion: {}", d.name))].into();
+        }
+        // Whether the phase is drawn wrapped or unwrapped.
+        let caption = (self.view == View::Phase && !self.phase.is_empty())
+            .then(|| corner_caption(self.phase_axis.caption().to_string()));
+        let empty = if rows { ALL_HIDDEN } else { EMPTY };
+        // Whether the note stands alone on an empty plot.
+        let (note, alone) = match self.view {
+            View::Response => (
+                (self.traces.is_empty() && self.live.is_none()).then(|| empty.to_string()),
+                true,
+            ),
+            View::Phase if self.no_phase > 0 => {
+                (Some(no_phase_note(self.no_phase)), self.phase.is_empty())
+            }
+            View::Phase => (self.phase.is_empty().then(|| empty.to_string()), true),
+            View::Distortion => (Some(self.distortion_note.clone()), true),
+        };
+        let Some(note) = note else {
+            return match caption {
+                Some(caption) => stack![canvas, caption].into(),
+                None => canvas.into(),
+            };
+        };
+        let note = container(text(note).style(theme::text(|p| p.fg_dim)))
+            .padding([4, 10])
+            .style(theme::backdrop);
+        let placed = if alone {
+            container(note).center(Length::Fill)
+        } else {
+            // Beside traces: out of their way, under the plot.
+            container(note)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(Vertical::Bottom)
+                .padding(iced::Padding::ZERO.bottom(34.0))
+                .width(Length::Fill)
+                .height(Length::Fill)
+        };
+        stack![canvas, placed].extend(caption).into()
+    }
+}
+
+/// A caption in the plot's bottom-left corner.
+fn corner_caption<'a>(content: String) -> Element<'a, Hover> {
+    let caption = container(
+        text(content)
+            .size(LABEL_SIZE)
+            .style(theme::text(|p| p.fg_dim)),
+    )
+    .padding([2, 8])
+    .style(theme::backdrop);
+    container(caption)
+        .align_x(iced::alignment::Horizontal::Left)
+        .align_y(Vertical::Bottom)
+        .padding(iced::Padding {
+            left: INSETS.left + 6.0,
+            bottom: INSETS.bottom + 6.0,
+            ..iced::Padding::ZERO
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The quietest and loudest levels of the points drawn, the line's ends included.
+fn extent_of(response: &Response) -> Option<(f64, f64)> {
+    plotted(response)
+        .map(|(_, db)| db)
+        .filter(|db| db.is_finite())
+        .map(|db| (db, db))
+        .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+}
+
+/// Most lines the hover readout shows, the frequency's and "+N more" included.
+const READOUT_LINES: usize = 12;
+/// Longest trace name in the readout, in characters.
+const READOUT_NAME: usize = 18;
+
+/// Every trace with a level at `freq` (the live RTA trace as "Live"), loudest
+/// first. The names are the traces' display names, prepared by `Graph::set`.
+fn readout_lines<'a>(
+    traces: &'a [Trace],
+    live: Option<&Response>,
+    freq: f64,
+) -> Vec<(&'a str, Ink, f64)> {
+    let mut lines: Vec<_> = traces
+        .iter()
+        .map(|t| (t.name.as_str(), Ink::Trace(t.color), &t.response))
+        .chain(live.map(|r| ("Live", Ink::Fg, r)))
+        .filter_map(|(name, ink, r)| {
+            let level = r.interp_db(freq);
+            level.is_finite().then_some((name, ink, level))
+        })
+        .collect();
+    lines.sort_by(|a, b| b.2.total_cmp(&a.2));
+    lines
+}
+
+/// `name` as one readout row: each whitespace run a single space, cut to
+/// `READOUT_NAME` characters.
+pub(crate) fn readout_name(name: &str) -> String {
+    let one_line = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    cut(&one_line, READOUT_NAME)
+}
+
+/// `name` cut to `limit` characters, ending in an ellipsis when cut.
+fn cut(name: &str, limit: usize) -> String {
+    let limit = limit.max(1);
+    if name.chars().count() <= limit {
+        return name.to_string();
+    }
+    let mut out: String = name.chars().take(limit - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Padding inside the readout card, top and bottom together.
+const CARD_PAD: f32 = 6.0;
+
+/// How many trace lines and how many "+N more" to show for `total` traces on a plot
+/// `height` high with rows `row` high; `None` when not even the frequency's row fits.
+fn card_rows(height: f32, row: f32, total: usize) -> Option<(usize, usize)> {
+    let rows = ((height - CARD_PAD) / row) as usize;
+    match rows {
+        0 => None,
+        1 => Some((0, 0)),
+        _ => Some(readout_fit(total, rows - 1)),
+    }
+}
+
+/// Where the card of `size` goes for a pointer at (`x`, `y`): beside it on the
+/// side with room (right, else left; below, else above), then clamped inside the plot.
+fn card_origin(plot: &PlotBox, x: f32, y: f32, size: Size) -> Point {
+    let left = if x + 10.0 + size.width <= plot.right() {
+        x + 10.0
+    } else {
+        x - 10.0 - size.width
+    }
+    .clamp(plot.left, (plot.right() - size.width).max(plot.left));
+    let top = if y + 10.0 + size.height <= plot.bottom() {
+        y + 10.0
+    } else {
+        y - 10.0 - size.height
+    }
+    .clamp(plot.top, (plot.bottom() - size.height).max(plot.top));
+    Point::new(left, top)
+}
+
+/// How many of `total` trace lines to show in `room` lines (the frequency's line not
+/// counted), and how many are left out. A "+N more" line takes the last of the room.
+fn readout_fit(total: usize, room: usize) -> (usize, usize) {
+    let room = room.min(READOUT_LINES - 1);
+    if total <= room {
+        (total, 0)
+    } else {
+        let shown = room.saturating_sub(1);
+        (shown, total - shown)
+    }
+}
+
+struct Plot<'a> {
+    graph: &'a Graph,
+    hover: Option<(f64, f64)>,
+}
+
+impl canvas::Program<Hover> for Plot<'_> {
+    /// The hover last published.
+    type State = Option<Hover>;
+
+    fn update(
+        &self,
+        last: &mut Option<Hover>,
+        event: &canvas::Event,
+        bounds: Rectangle,
+        cursor: Cursor,
+    ) -> Option<canvas::Action<Hover>> {
+        let canvas::Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) =
+            event
+        else {
+            return None;
+        };
+        let plot = PlotBox::inside(bounds.width, bounds.height, INSETS);
+        let hover = match cursor.position_in(bounds) {
+            Some(at) if plot.contains(at.x, at.y) => {
+                let (axis, top) = self.graph.axis(plot);
+                Hover::At {
+                    freq: axis.freq_at(at.x),
+                    db: axis.db_at(at.y, top),
+                }
+            }
+            _ => Hover::Left,
+        };
+        if *last == Some(hover) {
+            return None;
+        }
+        *last = Some(hover);
+        Some(canvas::Action::publish(hover))
+    }
+
+    fn draw(
+        &self,
+        _last: &Option<Hover>,
+        renderer: &Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        cursor: Cursor,
+    ) -> Vec<Geometry> {
+        let p = Palette::of(theme);
+        let size = bounds.size();
+        let plot = PlotBox::inside(size.width, size.height, INSETS);
+        let graph = self.graph;
+        // The dB axis follows the plot's shape in any view, so its span is
+        // tracked even while another view is up.
+        graph.drawn_span.set(plot.span);
+        let (plot, top_db) = graph.axis(plot);
+        let base = graph.cache.draw(renderer, size, |frame| {
+            #[cfg(test)]
+            graph.drawn.set(graph.drawn.get() + 1);
+            draw_frame(frame, &plot, &p);
+            match graph.view {
+                View::Response => {
+                    draw_db_grid(frame, &plot, top_db, &p);
+                    draw_traces(frame, &plot, graph, top_db, &p);
+                }
+                View::Phase => {
+                    draw_phase_grid(frame, &plot, top_db, &p);
+                    draw_phase_traces(frame, &plot, graph, top_db, &p);
+                }
+                View::Distortion => {
+                    draw_distortion(frame, &plot, graph, top_db, &p);
+                }
+            }
+        });
+        let live = graph.live_cache.draw(renderer, size, |frame| {
+            if let (View::Response, Some(response)) = (graph.view, &graph.live) {
+                draw_live(frame, &plot, response, top_db, &p);
+            }
+        });
+        let mut overlay = Frame::new(renderer, size);
+        // Read the pointer against the axis as drawn now: the published
+        // hover may predate an axis move. Headless snapshots have no cursor.
+        let hover = match cursor.position() {
+            Some(_) => cursor
+                .position_in(bounds)
+                .filter(|at| plot.contains(at.x, at.y))
+                .map(|at| (plot.freq_at(at.x), plot.db_at(at.y, top_db))),
+            None => self.hover,
+        };
+        if let Some((freq, db)) = hover {
+            match graph.view {
+                View::Response => draw_hover(&mut overlay, &plot, graph, top_db, freq, db, &p),
+                View::Phase => {
+                    draw_phase_hover(&mut overlay, &plot, graph, top_db, freq, db, &p);
+                }
+                View::Distortion => {
+                    draw_distortion_hover(&mut overlay, &plot, graph, freq, db, &p);
+                }
+            }
+        }
+        vec![base, live, overlay.into_geometry()]
+    }
+}
+
+fn label(
+    content: String,
+    position: Point,
+    align_x: Alignment,
+    align_y: Vertical,
+    p: &Palette,
+) -> Text {
+    Text {
+        content,
+        position,
+        color: p.fg_dim,
+        size: LABEL_SIZE.into(),
+        font: theme::mono(),
+        align_x,
+        align_y,
+        ..Text::default()
+    }
+}
+
+fn line(frame: &mut Frame, from: Point, to: Point, color: iced::Color) {
+    frame.stroke(
+        &Path::line(from, to),
+        Stroke::default()
+            .with_color(color)
+            .with_width(theme::HAIRLINE),
+    );
+}
+
+/// The background and the log frequency lines and their labels: hairlines
+/// on black, mono numbers.
+fn draw_frame(frame: &mut Frame, plot: &PlotBox, p: &Palette) {
+    let size = frame.size();
+    let background = Path::rounded_rectangle(
+        Point::new(0.5, 0.5),
+        Size::new(size.width - 1.0, size.height - 1.0),
+        theme::RADIUS.into(),
+    );
+    frame.fill(&background, p.bg);
+    frame.stroke(
+        &background,
+        Stroke::default()
+            .with_color(p.border)
+            .with_width(theme::HAIRLINE),
+    );
+    let labelled = plot::freq_label_multiples(plot.width, LABEL_SIZE);
+    for (f, tick) in plot::freq_grid() {
+        let x = plot.x_of(f);
+        let color = match tick {
+            Tick::Minor => p.bg_overlay,
+            Tick::Major | Tick::Decade => p.border,
+        };
+        line(
+            frame,
+            Point::new(x, plot.top),
+            Point::new(x, plot.bottom()),
+            color,
+        );
+        if labelled.contains(&plot::multiple(f)) {
+            frame.fill_text(label(
+                plot::freq_tick(f),
+                Point::new(x, plot.bottom() + 6.0),
+                Alignment::Center,
+                Vertical::Top,
+                p,
+            ));
+        }
+    }
+}
+
+/// The dB lines and their labels.
+fn draw_db_grid(frame: &mut Frame, plot: &PlotBox, top_db: f64, p: &Palette) {
+    let (lines, majors) = db_steps(plot);
+    let labels = label_step(plot, lines, majors);
+    for db in plot::db_grid(top_db, plot.span, lines) {
+        let y = plot.y_of(db, top_db);
+        let labelled = (db / labels).fract() == 0.0;
+        let color = if (db / majors).fract() == 0.0 {
+            p.border
+        } else {
+            p.bg_overlay
+        };
+        line(
+            frame,
+            Point::new(plot.left, y),
+            Point::new(plot.right(), y),
+            color,
+        );
+        if labelled {
+            frame.fill_text(label(
+                plot::db_tick(db),
+                Point::new(plot.left - 6.0, y),
+                Alignment::Right,
+                Vertical::Center,
+                p,
+            ));
+        }
+    }
+}
+
+/// The phase lines (every 45°) and their labels (spaced to fit the plot's
+/// height: see [`phase_label_step`]).
+fn draw_phase_grid(frame: &mut Frame, plot: &PlotBox, top: f64, p: &Palette) {
+    let steps = (plot.span / PHASE_LINES).round() as i32;
+    let labels = phase_label_step(plot);
+    for k in 0..=steps {
+        let deg = top - f64::from(k) * PHASE_LINES;
+        let y = plot.y_of(deg, top);
+        let labelled = (deg / labels).fract() == 0.0;
+        let color = if (deg / PHASE_MAJORS).fract() == 0.0 {
+            p.border
+        } else {
+            p.bg_overlay
+        };
+        line(
+            frame,
+            Point::new(plot.left, y),
+            Point::new(plot.right(), y),
+            color,
+        );
+        if labelled {
+            frame.fill_text(label(
+                plot::phase_label(deg),
+                Point::new(plot.left - 6.0, y),
+                Alignment::Right,
+                Vertical::Center,
+                p,
+            ));
+        }
+    }
+}
+
+/// Each phase trace in its colour, broken at gaps, and at wraps when the
+/// view wraps phase.
+fn draw_phase_traces(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p: &Palette) {
+    let (traces, wrapped) = graph.phase_shown();
+    for trace in traces {
+        let points: Vec<(f64, f64)> = if wrapped {
+            trace.plotted()
+        } else {
+            trace
+                .freq
+                .iter()
+                .copied()
+                .zip(trace.deg.iter().copied())
+                .collect()
+        };
+        let runs = if wrapped {
+            phase_segments(&points)
+        } else {
+            points
+                .split(|(_, deg)| !deg.is_finite())
+                .filter(|run| !run.is_empty())
+                .map(<[_]>::to_vec)
+                .collect()
+        };
+        let path = Path::new(|b| {
+            for run in &runs {
+                let mut points = run
+                    .iter()
+                    .map(|(f, deg)| Point::new(plot.x_of(*f), plot.y_of(*deg, top)));
+                let Some(first) = points.next() else {
+                    continue;
+                };
+                if run.len() == 1 {
+                    // Alone between gaps: a dot.
+                    b.circle(first, 0.75);
+                    continue;
+                }
+                b.move_to(first);
+                for at in points {
+                    b.line_to(at);
+                }
+            }
+        });
+        frame.stroke(
+            &path,
+            Stroke::default()
+                .with_color(p.trace(trace.color))
+                .with_width(TRACE_WIDTH)
+                .with_line_join(canvas::LineJoin::Round),
+        );
+    }
+}
+
+/// The dB between grid lines and between labels: 5 and 10, scaled up by 2,
+/// 5, 10, … when a narrow plot's labels would overlap, which also bounds the
+/// number of lines by the plot's height.
+fn db_steps(plot: &PlotBox) -> (f64, f64) {
+    let label_px = f64::from(plot.height) * DB_LABELS / plot.span;
+    let need = f64::from(LABEL_SIZE + 4.0) / label_px;
+    let mut stride = 1.0;
+    'search: loop {
+        for m in [1.0, 2.0, 5.0] {
+            if stride * m >= need {
+                stride *= m;
+                break 'search;
+            }
+        }
+        stride *= 10.0;
+    }
+    (DB_LINES * stride, DB_LABELS * stride)
+}
+
+/// The step between labelled lines on a vertical axis with lines every
+/// `lines` and brighter ones every `majors`: every line when the lines stand
+/// [`LABEL_ROOM`] apart on `plot`, else the brighter ones.
+fn label_step(plot: &PlotBox, lines: f64, majors: f64) -> f64 {
+    let px = f64::from(plot.height) * lines / plot.span;
+    if px >= f64::from(LABEL_ROOM) {
+        lines
+    } else {
+        majors
+    }
+}
+
+/// The degrees between phase labels: every 45° or 90° line as
+/// [`label_step`] says, thinned further (180°, 360°…) where a 90° step is
+/// closer than a label's height and a little room.
+fn phase_label_step(plot: &PlotBox) -> f64 {
+    let mut step = label_step(plot, PHASE_LINES, PHASE_MAJORS);
+    let px = |step: f64| f64::from(plot.height) * step / plot.span;
+    while step < plot.span && px(step) < f64::from(LABEL_SIZE + 4.0) {
+        step *= 2.0;
+    }
+    step
+}
+
+/// Whether the percent axis has room to label the 2× and 5× lines of each
+/// decade: their closest neighbours are a third of a decade apart.
+fn percent_minor_labels(plot: &PlotBox) -> bool {
+    f64::from(plot.height) / PCT_SPAN * 2f64.log10() >= f64::from(LABEL_ROOM)
+}
+
+/// A percent axis label: "0.01 %", "0.5 %", "20 %".
+fn percent_tick(decade: i32, m: u32) -> String {
+    let decimals = (-decade).max(0) as usize;
+    format!("{:.*} %", decimals, 10f64.powi(decade) * f64::from(m))
+}
+
+/// Each trace in its colour, broken where it has no data and held to the
+/// plot: cut at 20 Hz and 20 kHz, levels beyond the axis pinned to its edge.
+///
+/// Clipped by hand: iced_wgpu 0.14 drops what a `Frame::with_clip` draft
+/// draws in this cached layer (the traces vanished from wgpu snapshots
+/// while tiny-skia drew them).
+fn draw_traces(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top_db: f64, p: &Palette) {
+    for trace in &graph.traces {
+        frame.stroke(
+            &trace_path(plot, &trace.response, top_db),
+            Stroke::default()
+                .with_color(p.trace(trace.color))
+                .with_width(TRACE_WIDTH)
+                .with_line_join(canvas::LineJoin::Round),
+        );
+    }
+}
+
+/// The RTA's live trace: the foreground colour, dashed, so it never
+/// shares a colour with a measurement.
+fn draw_live(frame: &mut Frame, plot: &PlotBox, response: &Response, top_db: f64, p: &Palette) {
+    frame.stroke(
+        &trace_path(plot, response, top_db),
+        Stroke {
+            line_dash: canvas::LineDash {
+                segments: &[6.0, 4.0],
+                offset: 0,
+            },
+            ..Stroke::default()
+                .with_color(p.fg)
+                .with_width(TRACE_WIDTH)
+                .with_line_join(canvas::LineJoin::Round)
+        },
+    );
+}
+
+/// `response` as a line, broken where it has no data.
+fn trace_path(plot: &PlotBox, response: &Response, top_db: f64) -> Path {
+    Path::new(|b| {
+        let mut drawing = false;
+        for (f, db) in plotted(response) {
+            if !db.is_finite() {
+                drawing = false;
+                continue;
+            }
+            let y = plot.y_of(db, top_db).clamp(plot.top, plot.bottom());
+            let at = Point::new(plot.x_of(f), y);
+            if drawing {
+                b.line_to(at);
+            } else {
+                b.move_to(at);
+                drawing = true;
+            }
+        }
+    })
+}
+
+/// `response`'s points inside the plotted decades, with its levels at the
+/// two ends (`NaN` where it has none).
+fn plotted(response: &Response) -> impl Iterator<Item = (f64, f64)> + '_ {
+    let inside = response
+        .freq
+        .iter()
+        .zip(&response.db)
+        .filter(|(f, _)| plot::F_MIN < **f && **f < plot::F_MAX)
+        .map(|(f, db)| (*f, *db));
+    std::iter::once((plot::F_MIN, response.interp_db(plot::F_MIN)))
+        .chain(inside)
+        .chain(std::iter::once((
+            plot::F_MAX,
+            response.interp_db(plot::F_MAX),
+        )))
+}
+
+/// The Distortion view's grid, curves and curve names.
+fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p: &Palette) {
+    let Some(d) = &graph.distortion else {
+        return;
+    };
+    match d.units {
+        Units::Percent => draw_percent_grid(frame, plot, p),
+        Units::Db => draw_db_grid(frame, plot, top, p),
+    }
+    let ink = |ink: Ink| match ink {
+        Ink::Trace(i) => p.trace(i),
+        Ink::Fg => p.fg,
+        Ink::Dim => p.fg_dim,
+    };
+    let mut ends = Vec::new();
+    for curve in &d.curves {
+        let path = Path::new(|b| {
+            let mut drawing = false;
+            for (f, y) in curve.plotted() {
+                if !y.is_finite() {
+                    drawing = false;
+                    continue;
+                }
+                let at = Point::new(
+                    plot.x_of(f),
+                    plot.y_of(y, top).clamp(plot.top, plot.bottom()),
+                );
+                if drawing {
+                    b.line_to(at);
+                } else {
+                    b.move_to(at);
+                    drawing = true;
+                }
+            }
+        });
+        let width = if curve.thick { THD_WIDTH } else { TRACE_WIDTH };
+        let stroke = Stroke {
+            line_dash: if curve.dashed {
+                canvas::LineDash {
+                    segments: &[6.0, 4.0],
+                    offset: 0,
+                }
+            } else {
+                canvas::LineDash::default()
+            },
+            ..Stroke::default()
+                .with_color(ink(curve.ink))
+                .with_width(width)
+                .with_line_join(canvas::LineJoin::Round)
+        };
+        frame.stroke(&path, stroke);
+        let last = curve.plotted().filter(|(_, y)| y.is_finite()).last();
+        if let (true, Some((_, y))) = (curve.labelled, last) {
+            ends.push((plot.y_of(y, top), curve));
+        }
+    }
+    // Names at the right end of their curves, spread so they stay apart and
+    // inside the plot.
+    ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let wanted: Vec<f32> = ends.iter().map(|(y, _)| *y).collect();
+    let Some(ys) = label_rows(&wanted, plot) else {
+        return;
+    };
+    let low = plot.top + LABEL_SIZE / 2.0;
+    for ((_, curve), y) in ends.iter().zip(ys) {
+        frame.fill_text(Text {
+            color: ink(curve.ink),
+            ..label(
+                curve.label.clone(),
+                Point::new(plot.right() - 4.0, y.max(low)),
+                Alignment::Right,
+                Vertical::Center,
+                p,
+            )
+        });
+    }
+}
+
+/// Rows for names wanting the sorted `wanted` heights: spread so they stay apart and inside
+/// the plot. `None` when the plot is too short for them; the curves' names are on hover.
+fn label_rows(wanted: &[f32], plot: &PlotBox) -> Option<Vec<f32>> {
+    let room = plot.height - LABEL_SIZE;
+    if room < LABEL_GAP * wanted.len().saturating_sub(1) as f32 {
+        return None;
+    }
+    let (low, high) = (
+        plot.top + LABEL_SIZE / 2.0,
+        plot.bottom() - LABEL_SIZE / 2.0,
+    );
+    let mut ys: Vec<f32> = wanted.iter().map(|y| y.clamp(low, high)).collect();
+    for i in 1..ys.len() {
+        ys[i] = ys[i].max(ys[i - 1] + LABEL_GAP);
+    }
+    for i in (0..ys.len()).rev() {
+        let ceiling = ys.get(i + 1).map_or(high, |next| next - LABEL_GAP);
+        ys[i] = ys[i].min(ceiling);
+    }
+    Some(ys)
+}
+
+/// The percent axis: a line per decade with its label, and fainter lines at
+/// 2..9 times each, the 2× and 5× ones labelled when there is room.
+fn draw_percent_grid(frame: &mut Frame, plot: &PlotBox, p: &Palette) {
+    let minors = percent_minor_labels(plot);
+    for decade in -2..=2 {
+        for m in 1..=9 {
+            let pct = 10f64.powi(decade) * f64::from(m);
+            if pct > 100.0 {
+                break;
+            }
+            let y = percent_y(plot, pct);
+            let major = m == 1;
+            line(
+                frame,
+                Point::new(plot.left, y),
+                Point::new(plot.right(), y),
+                if major { p.border } else { p.bg_overlay },
+            );
+            if major || (minors && (m == 2 || m == 5)) {
+                frame.fill_text(label(
+                    percent_tick(decade, m),
+                    Point::new(plot.left - 6.0, y),
+                    Alignment::Right,
+                    Vertical::Center,
+                    p,
+                ));
+            }
+        }
+    }
+}
+
+/// The Distortion view's crosshair and the readout of the curve nearest
+/// `y`: "1.23 kHz  H3 0.042 %".
+fn draw_distortion_hover(
+    frame: &mut Frame,
+    plot: &PlotBox,
+    graph: &Graph,
+    freq: f64,
+    y: f64,
+    p: &Palette,
+) {
+    let x = plot.x_of(freq);
+    line(
+        frame,
+        Point::new(x, plot.top),
+        Point::new(x, plot.bottom()),
+        p.fg_faint,
+    );
+    let top = graph.axis(*plot).1;
+    let readout = match graph
+        .distortion
+        .as_ref()
+        .and_then(|d| Some((d, d.nearest(freq, y)?)))
+    {
+        Some((d, (curve, at))) => {
+            let py = plot.y_of(at, top);
+            if (plot.top..=plot.bottom()).contains(&py) {
+                line(
+                    frame,
+                    Point::new(plot.left, py),
+                    Point::new(plot.right(), py),
+                    p.fg_faint,
+                );
+                let color = match curve.ink {
+                    Ink::Trace(i) => p.trace(i),
+                    Ink::Fg => p.fg,
+                    Ink::Dim => p.fg_dim,
+                };
+                frame.fill(&Path::circle(Point::new(x, py), 3.5), color);
+            }
+            format!(
+                "{}  {} {}",
+                plot::freq_label(freq),
+                curve.label,
+                d.reading(at)
+            )
+        }
+        None => plot::freq_label(freq),
+    };
+    draw_readout(frame, plot, x, readout, p);
+}
+
+/// The crosshair at `freq`, a dot on every trace there and a readout of all their levels.
+fn draw_hover(
+    frame: &mut Frame,
+    plot: &PlotBox,
+    graph: &Graph,
+    top_db: f64,
+    freq: f64,
+    db: f64,
+    p: &Palette,
+) {
+    let x = plot.x_of(freq);
+    line(
+        frame,
+        Point::new(x, plot.top),
+        Point::new(x, plot.bottom()),
+        p.fg_faint,
+    );
+    let lines = readout_lines(&graph.traces, graph.live.as_ref(), freq);
+    for (_, ink, level) in &lines {
+        let y = plot.y_of(*level, top_db).clamp(plot.top, plot.bottom());
+        let color = match ink {
+            Ink::Trace(i) => p.trace(*i),
+            Ink::Fg => p.fg,
+            Ink::Dim => p.fg_dim,
+        };
+        frame.fill(&Path::circle(Point::new(x, y), 3.5), color);
+    }
+    let row = LABEL_SIZE + 4.0;
+    let Some((shown, more)) = card_rows(plot.height, row, lines.len()) else {
+        return;
+    };
+    // The whole card is drawn in the mono font, so a character's advance is a
+    // fixed 0.6 em and the widths below match the drawn text exactly.
+    let width_of = |content: &str| content.chars().count() as f32 * LABEL_SIZE * 0.6;
+    let freq_text = plot::freq_label(freq);
+    let more_text = format!("+{more} more");
+    let levels: Vec<String> = lines[..shown]
+        .iter()
+        .map(|l| format!("{:+.1} dB", l.2))
+        .collect();
+    // Swatch and gaps around the name and the level.
+    let level_width = levels.iter().map(|l| width_of(l)).fold(0.0, f32::max);
+    let fixed = 28.0 + 12.0 + level_width;
+    // A card wider than the plot gets shorter names, not a smaller scale.
+    let name_room = (((plot.width - fixed) / (LABEL_SIZE * 0.6)) as usize).max(1);
+    let names: Vec<Cow<str>> = lines[..shown]
+        .iter()
+        .map(|l| {
+            if l.0.chars().count() > name_room {
+                Cow::Owned(cut(l.0, name_room))
+            } else {
+                Cow::Borrowed(l.0)
+            }
+        })
+        .collect();
+    let rows = 1 + shown + usize::from(more > 0);
+    let mut width = width_of(&freq_text) + 14.0;
+    if more > 0 {
+        width = width.max(width_of(&more_text) + 14.0);
+    }
+    for (name, level) in names.iter().zip(&levels) {
+        width = width.max(28.0 + width_of(name) + 12.0 + width_of(level));
+    }
+    let height = row * rows as f32 + CARD_PAD;
+    let pointer = plot.y_of(db, top_db).clamp(plot.top, plot.bottom());
+    let at = card_origin(plot, x, pointer, Size::new(width, height));
+    let card = Path::rounded_rectangle(at, Size::new(width, height), theme::RADIUS.into());
+    frame.fill(&card, p.bg_raised);
+    frame.stroke(
+        &card,
+        Stroke::default()
+            .with_color(p.border)
+            .with_width(theme::HAIRLINE),
+    );
+    let text = |content: String, x: f32, row_y: f32, align: Alignment| Text {
+        color: p.fg,
+        font: theme::mono(),
+        ..label(content, Point::new(x, row_y), align, Vertical::Center, p)
+    };
+    let row_y = |i: usize| at.y + CARD_PAD / 2.0 + row * (i as f32 + 0.5);
+    frame.fill_text(text(freq_text, at.x + 7.0, row_y(0), Alignment::Left));
+    for (i, ((_, ink, _), (name, level))) in lines[..shown]
+        .iter()
+        .zip(names.iter().zip(levels))
+        .enumerate()
+    {
+        let y = row_y(i + 1);
+        let color = match ink {
+            Ink::Trace(i) => p.trace(*i),
+            Ink::Fg => p.fg,
+            Ink::Dim => p.fg_dim,
+        };
+        let swatch = Path::rectangle(Point::new(at.x + 7.0, y - 3.0), Size::new(8.0, 6.0));
+        frame.fill(&swatch, color);
+        frame.fill_text(text(name.to_string(), at.x + 21.0, y, Alignment::Left));
+        frame.fill_text(text(level, at.x + width - 7.0, y, Alignment::Right));
+    }
+    if more > 0 {
+        frame.fill_text(text(
+            more_text,
+            at.x + 7.0,
+            row_y(rows - 1),
+            Alignment::Left,
+        ));
+    }
+}
+
+/// The Phase view's crosshair and the readout of the trace nearest `deg`.
+fn draw_phase_hover(
+    frame: &mut Frame,
+    plot: &PlotBox,
+    graph: &Graph,
+    top: f64,
+    freq: f64,
+    deg: f64,
+    p: &Palette,
+) {
+    let x = plot.x_of(freq);
+    line(
+        frame,
+        Point::new(x, plot.top),
+        Point::new(x, plot.bottom()),
+        p.fg_faint,
+    );
+    let (traces, wrapped) = graph.phase_shown();
+    let readout = match nearest_phase(traces, freq, deg, wrapped) {
+        Some((trace, at)) => {
+            let y = plot.y_of(at, top);
+            line(
+                frame,
+                Point::new(plot.left, y),
+                Point::new(plot.right(), y),
+                p.fg_faint,
+            );
+            frame.fill(&Path::circle(Point::new(x, y), 3.5), p.trace(trace.color));
+            format!("{}  {}", plot::freq_label(freq), plot::phase_label(at))
+        }
+        None => plot::freq_label(freq),
+    };
+    draw_readout(frame, plot, x, readout, p);
+}
+
+/// The readout card beside the crosshair at `x`.
+fn draw_readout(frame: &mut Frame, plot: &PlotBox, x: f32, readout: String, p: &Palette) {
+    // The mono face's advance is about 0.6 em.
+    let width = readout.chars().count() as f32 * LABEL_SIZE * 0.6 + 14.0;
+    let height = LABEL_SIZE + 10.0;
+    let left = if x + 10.0 + width <= plot.right() {
+        x + 10.0
+    } else {
+        x - 10.0 - width
+    };
+    let at = Point::new(left, plot.top + 8.0);
+    let card = Path::rounded_rectangle(at, Size::new(width, height), theme::RADIUS.into());
+    frame.fill(&card, p.bg_raised);
+    frame.stroke(
+        &card,
+        Stroke::default()
+            .with_color(p.border)
+            .with_width(theme::HAIRLINE),
+    );
+    frame.fill_text(Text {
+        color: p.fg,
+        ..label(
+            readout,
+            Point::new(at.x + 7.0, at.y + height / 2.0),
+            Alignment::Left,
+            Vertical::Center,
+            p,
+        )
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat(db: f64) -> Trace {
+        let freq = vec![10.0, 20.0, 1000.0, 20_000.0, 24_000.0];
+        let mut levels = vec![db; freq.len()];
+        // Out of the plotted decades: never sets the scale.
+        levels[0] = db + 40.0;
+        Trace {
+            name: String::new(),
+            response: Response {
+                freq,
+                db: levels,
+                phase: None,
+            },
+            color: 0,
+        }
+    }
+
+    /// A plot `w` by `h` pixels inside the axis-label room.
+    fn sized(w: f32, h: f32) -> PlotBox {
+        PlotBox::inside(
+            w + INSETS.left + INSETS.right,
+            h + INSETS.top + INSETS.bottom,
+            INSETS,
+        )
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_big_plot_labels_every_db_line() {
+        // The dB span follows the shape: 5 dB is a twentieth of the width.
+        let big = sized(1400.0, 700.0);
+        let (lines, majors) = db_steps(&big);
+        assert_eq!((lines, majors), (DB_LINES, DB_LABELS));
+        assert_eq!(label_step(&big, lines, majors), DB_LINES);
+        let small = sized(400.0, 300.0);
+        let (lines, majors) = db_steps(&small);
+        assert_eq!(label_step(&small, lines, majors), majors);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_tall_plot_labels_every_45_degrees() {
+        let phase = |h| PlotBox {
+            span: PHASE_SPAN,
+            ..sized(1000.0, h)
+        };
+        assert_eq!(label_step(&phase(600.0), PHASE_LINES, PHASE_MAJORS), 45.0);
+        assert_eq!(label_step(&phase(150.0), PHASE_LINES, PHASE_MAJORS), 90.0);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_tall_plot_labels_2_and_5_percent_lines() {
+        assert!(percent_minor_labels(&sized(1000.0, 600.0)));
+        assert!(!percent_minor_labels(&sized(1000.0, 200.0)));
+        assert_eq!(percent_tick(-2, 1), "0.01 %");
+        assert_eq!(percent_tick(-2, 5), "0.05 %");
+        assert_eq!(percent_tick(-1, 2), "0.2 %");
+        assert_eq!(percent_tick(0, 5), "5 %");
+        assert_eq!(percent_tick(1, 2), "20 %");
+        assert_eq!(percent_tick(2, 1), "100 %");
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_axis_follows_the_loudest_shown_trace() {
+        let mut graph = Graph::default();
+        assert_eq!(graph.top_db(10.0), plot::EMPTY_TOP_DB);
+        graph.set(vec![flat(71.0), flat(83.2)]);
+        assert_eq!(graph.top_db(20.0), 90.0);
+        graph.set(Vec::new());
+        assert_eq!(graph.top_db(10.0), plot::EMPTY_TOP_DB);
+    }
+
+    // A tall plot (a tall or narrow window) has more dB than the curves
+    // need: they sit in the middle, not crowded under the top edge.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn spare_room_centres_the_curves() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(-10.0), flat(10.0)]);
+        // -10..+10 dB on a 100 dB axis: 40 dB spare above and below.
+        let top = graph.top_db(100.0);
+        assert_eq!(top, 50.0);
+        // Too little room to centre with margins: pinned to the loudest.
+        assert_eq!(graph.top_db(25.0), plot::top_db(Some(10.0)));
+    }
+
+    // A short, wide plot spans only a few dB: pinning the loudest level 5 dB
+    // under the top must not push every trace off the bottom edge.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_short_plot_keeps_the_curves_in_view() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(1.0)]);
+        let top = graph.top_db(5.0);
+        assert!(top > 1.0 && top - 5.0 < 1.0, "top {top}");
+    }
+
+    // Just past the span where centring starts, the top must not jump a
+    // whole step and leave the quietest level on the bottom edge.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn centring_keeps_room_below() {
+        let mut graph = Graph::default();
+        graph.set(vec![flat(-10.0), flat(0.0)]);
+        for span in [20.0, 20.01, 23.0, 37.5] {
+            let top = graph.top_db(span);
+            assert!(top - span <= -12.0 && top >= 2.0, "span {span}: top {top}");
+        }
+    }
+
+    // A live RTA update that moves the quietest level without moving the
+    // axis must not redraw the grid and every stored trace.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_live_update_that_keeps_the_axis_keeps_the_cache() {
+        let mut graph = Graph::default();
+        graph.drawn_span.set(100.0);
+        graph.set(vec![flat(0.0), flat(-20.0)]);
+        let live = |db: f64| flat(db).response;
+        graph.set_live(Some(live(-24.0)));
+        // The quietest level moves, the centred top (40 dB) does not.
+        graph.live = Some(live(-24.2));
+        assert!(!graph.rescale());
+        graph.live = Some(live(-40.0));
+        assert!(graph.rescale());
+    }
+
+    // Narrow plots stretch the dB span; labels and lines thin out so they
+    // never overlap and the line count stays bounded by the plot's height.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn db_steps_never_crowd() {
+        for (w, h) in [(900.0, 450.0), (80.0, 600.0), (1.0, 600.0)] {
+            let plot = PlotBox::inside(w + INSETS.left + INSETS.right, h, INSETS);
+            let (lines, labels) = db_steps(&plot);
+            let px = |db: f64| f64::from(plot.height) * db / plot.span;
+            assert!(
+                px(labels) >= f64::from(LABEL_SIZE) + 4.0,
+                "{w}x{h}: labels {labels}"
+            );
+            assert!(
+                plot.span / lines <= f64::from(plot.height),
+                "{w}x{h}: lines {lines}"
+            );
+            assert_eq!((labels / lines).fract(), 0.0);
+        }
+        let wide = PlotBox::inside(900.0 + INSETS.left + INSETS.right, 450.0, INSETS);
+        assert_eq!(db_steps(&wide), (DB_LINES, DB_LABELS));
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn the_distortion_axis_holds_a_wide_extent() {
+        let mut graph = Graph {
+            view: View::Distortion,
+            extent: Some((-175.0, 5.0)),
+            ..Graph::default()
+        };
+        let (span, top) = graph.distortion_db_axis(50.0);
+        assert!(top >= 5.0 && top - span <= -175.0, "span {span} top {top}");
+        // The cap is on the shape's request alone.
+        assert_eq!(graph.distortion_db_axis(500.0).0, 200.0);
+        // A live trace does not count outside the Response view.
+        graph.live = Some(flat(60.0).response);
+        graph.rescale();
+        assert_eq!(graph.extent, None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_axis_fits_a_curve_known_only_beyond_the_plot() {
+        let mut graph = Graph::default();
+        graph.set(vec![Trace {
+            name: String::new(),
+            response: Response {
+                freq: vec![10.0, 24_000.0],
+                db: vec![75.0, 75.0],
+                phase: None,
+            },
+            color: 0,
+        }]);
+        let top = graph.top_db(5.0);
+        assert!(top - 5.0 < 75.0 && 75.0 < top, "top {top}");
+    }
+
+    fn named(name: &str, db: f64) -> Trace {
+        Trace {
+            name: name.into(),
+            ..flat(db)
+        }
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_readout_lists_every_trace_loudest_first() {
+        let traces = [named("quiet", 70.0), named("loud", 80.0)];
+        let lines = readout_lines(&traces, None, 1000.0);
+        let names: Vec<_> = lines.iter().map(|l| l.0).collect();
+        assert_eq!(names, ["loud", "quiet"]);
+        assert_eq!((lines[0].2, lines[1].2), (80.0, 70.0));
+        // The live trace joins in, named "Live".
+        let live = flat(75.0).response;
+        let lines = readout_lines(&traces, Some(&live), 1000.0);
+        assert_eq!(lines[1].0, "Live");
+        assert!(matches!(lines[1].1, Ink::Fg));
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_readout_leaves_out_traces_without_data_there() {
+        let mut short = named("short", 90.0);
+        short.response = Response {
+            freq: vec![20.0, 500.0],
+            db: vec![90.0, 90.0],
+            phase: None,
+        };
+        let traces = [named("full", 70.0), short];
+        let lines = readout_lines(&traces, None, 1000.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "full");
+        assert!(readout_lines(&traces, None, 5.0).is_empty());
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_readout_counts_what_it_leaves_out() {
+        assert_eq!(readout_fit(3, 11), (3, 0));
+        assert_eq!(readout_fit(11, 11), (11, 0));
+        // Twelve lines: the frequency, 10 traces and "+N more".
+        assert_eq!(readout_fit(15, 40), (10, 5));
+        // A short plot shows what fits, the last line of room being "+N more".
+        assert_eq!(readout_fit(5, 3), (2, 3));
+        assert_eq!(readout_fit(5, 0), (0, 5));
+        let name = readout_name("a very long measurement name");
+        assert_eq!(name.chars().count(), READOUT_NAME);
+        assert!(name.ends_with('…'));
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_name_is_one_row() {
+        assert_eq!(readout_name("Left\nrear\t\t EQ"), "Left rear EQ");
+        // Graph::set prepares every trace's name once.
+        let mut graph = Graph::default();
+        graph.set(vec![named("a\r\nb", 70.0)]);
+        assert_eq!(graph.traces[0].name, "a b");
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_card_stays_inside_a_narrow_plot() {
+        let plot = sized(300.0, 300.0);
+        // 18-character name: swatch, name, gap and "+100.0 dB" in mono 11 px.
+        let size = Size::new(28.0 + 18.0 * 6.6 + 12.0 + 9.0 * 6.6, 40.0);
+        let at = card_origin(&plot, plot.left + 150.0, plot.top + 100.0, size);
+        assert!(
+            at.x >= plot.left && at.x + size.width <= plot.right(),
+            "{at:?}"
+        );
+        assert!(
+            at.y >= plot.top && at.y + size.height <= plot.bottom(),
+            "{at:?}"
+        );
+        // Wider than the plot: pinned to the left edge.
+        let wide = card_origin(
+            &plot,
+            plot.left + 150.0,
+            plot.top + 100.0,
+            Size::new(400.0, 40.0),
+        );
+        assert_eq!(wide.x, plot.left);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_short_plot_shows_the_level_that_fits() {
+        let row = LABEL_SIZE + 4.0;
+        // The frequency and one level need two rows and the padding.
+        assert_eq!(card_rows(2.0 * row + CARD_PAD, row, 1), Some((1, 0)));
+        assert_eq!(card_rows(50.0, row, 1), Some((1, 0)));
+        // Only the frequency fits, then nothing.
+        assert_eq!(card_rows(row + CARD_PAD, row, 3), Some((0, 0)));
+        assert_eq!(card_rows(row + CARD_PAD - 1.0, row, 3), None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn traces_are_cut_at_the_plotted_decades() {
+        let response = Response {
+            freq: vec![10.0, 100.0, 1000.0, 30_000.0],
+            db: vec![0.0, 10.0, f64::NAN, 0.0],
+            phase: None,
+        };
+        let points: Vec<_> = plotted(&response).collect();
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[0].0, plot::F_MIN);
+        assert!((points[0].1 - 3.0103).abs() < 1e-3, "{}", points[0].1);
+        assert_eq!(points[1], (100.0, 10.0));
+        assert!(points[2].1.is_nan(), "a gap stays a gap");
+        assert_eq!(points[3].0, plot::F_MAX);
+        assert!(points[3].1.is_nan(), "no level next to the gap");
+    }
+
+    // Phase is wrapped: a line that jumps across the wrap breaks, and each
+    // side runs on to the edge it crossed, at the crossing's frequency.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn phase_breaks_at_wrap() {
+        let wrapped = phase_segments(&[(100.0, -170.0), (200.0, 170.0), (400.0, 160.0)]);
+        assert_eq!(wrapped.len(), 2);
+        // -170 -> 170 is -170 -> -190: the crossing of -180 is halfway in log f.
+        let mid = (100.0_f64 * 200.0).sqrt();
+        assert_eq!(wrapped[0].len(), 2);
+        assert_eq!(wrapped[0][0], (100.0, -170.0));
+        assert!((wrapped[0][1].0 - mid).abs() < 1e-9);
+        assert_eq!(wrapped[0][1].1, -180.0);
+        assert!((wrapped[1][0].0 - mid).abs() < 1e-9);
+        assert_eq!(wrapped[1][0].1, 180.0);
+        assert_eq!(wrapped[1][1..], [(200.0, 170.0), (400.0, 160.0)]);
+        let up = phase_segments(&[(100.0, 170.0), (200.0, -170.0)]);
+        assert_eq!((up[0][1].1, up[1][0].1), (180.0, -180.0));
+        let smooth = phase_segments(&[(100.0, -10.0), (200.0, 90.0), (400.0, 179.0)]);
+        assert_eq!(smooth.len(), 1);
+        let gap = phase_segments(&[(100.0, 0.0), (200.0, f64::NAN), (400.0, 5.0)]);
+        assert_eq!(gap.len(), 2);
+    }
+
+    // Phase falling 200 degrees a point wraps at nearly every point: each
+    // must still be drawn, in a run of at least two points.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn dense_wraps_leave_no_point_alone() {
+        let points: Vec<(f64, f64)> = (0..8)
+            .map(|k| {
+                let deg = -200.0 * f64::from(k) + 160.0;
+                (
+                    100.0 * 1.1_f64.powi(k),
+                    (deg + 180.0).rem_euclid(360.0) - 180.0,
+                )
+            })
+            .collect();
+        let runs = phase_segments(&points);
+        assert!(runs.iter().all(|r| r.len() >= 2), "{runs:?}");
+        for point in &points {
+            assert!(runs.iter().any(|r| r.contains(point)), "{point:?}");
+        }
+    }
+
+    /// A trace over 20 Hz–20 kHz whose phase falls linearly in log f from
+    /// `from` to `to` degrees, wrapped to (−180, 180].
+    fn ramp(from: f64, to: f64) -> (PhaseTrace, Vec<f64>) {
+        let n = 200;
+        let freq: Vec<f64> = (0..n)
+            .map(|i| plot::F_MIN * 1000f64.powf(i as f64 / (n - 1) as f64))
+            .collect();
+        let line: Vec<f64> = (0..n)
+            .map(|i| from + (to - from) * i as f64 / (n - 1) as f64)
+            .collect();
+        let wrap = |d: f64| 180.0 - (180.0 - d).rem_euclid(360.0);
+        let trace = PhaseTrace {
+            freq,
+            deg: line.iter().map(|d| wrap(*d)).collect(),
+            color: 0,
+        };
+        (trace, line)
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_wrapped_ramp_unwraps_to_a_straight_line() {
+        let (trace, line) = ramp(-100.0, -500.0);
+        assert!(trace.deg.iter().all(|d| *d > -180.0 && *d <= 180.0));
+        let out = unwrap_phase(&trace.freq, &trace.deg);
+        // At 1 kHz the line is near −326°: anchored a turn up, near +34°.
+        for (got, want) in out.iter().zip(&line) {
+            assert!((got - (want + 360.0)).abs() < 1e-9, "{got} vs {want}");
+        }
+        // A gap keeps its place, and the rest stays on the line.
+        let mut gappy = trace.deg.clone();
+        for d in &mut gappy[90..100] {
+            *d = f64::NAN;
+        }
+        let out = unwrap_phase(&trace.freq, &gappy);
+        assert!(out[90..100].iter().all(|d| d.is_nan()));
+        for (i, (got, want)) in out.iter().zip(&line).enumerate() {
+            if !(90..100).contains(&i) {
+                assert!((got - (want + 360.0)).abs() < 1e-9, "{i}: {got}");
+            }
+        }
+    }
+
+    // Bugs caught: 0, False positives: 1
+    #[test]
+    fn phase_wraps_when_it_spans_more_than_720_degrees() {
+        let mut graph = Graph::default();
+        graph.set_phase(vec![ramp(-100.0, -500.0).0], 0);
+        // 260° down to −140°: 270° to −180°, then 45° lines from the top.
+        assert_eq!(
+            graph.phase_axis,
+            PhaseAxis::Unwrapped {
+                top: 270.0,
+                span: 450.0
+            }
+        );
+        assert_eq!(graph.phase_axis.caption(), "Phase · unwrapped");
+        let (shown, wrapped) = graph.phase_shown();
+        assert!(!wrapped);
+        assert!(shown[0].deg.windows(2).all(|w| (w[1] - w[0]).abs() < 180.0));
+        // A short range is drawn on at least a full turn.
+        graph.set_phase(vec![ramp(10.0, -20.0).0], 0);
+        assert_eq!(
+            graph.phase_axis,
+            PhaseAxis::Unwrapped {
+                top: 180.0,
+                span: 360.0
+            }
+        );
+        // Two traces that fit alone but span 820° together wrap: anchored,
+        // the first runs 360°..−340°, the second −460°..140°.
+        graph.set_phase(vec![ramp(0.0, -700.0).0], 0);
+        assert!(matches!(graph.phase_axis, PhaseAxis::Unwrapped { .. }));
+        graph.set_phase(vec![ramp(0.0, -700.0).0, ramp(-100.0, 500.0).0], 0);
+        assert_eq!(graph.phase_axis, PhaseAxis::Wrapped);
+        assert_eq!(graph.phase_axis.caption(), "Phase · wrapped");
+        assert!(graph.phase_shown().1);
+        graph.set_phase(vec![ramp(0.0, -900.0).0], 0);
+        assert_eq!(graph.phase_axis, PhaseAxis::Wrapped);
+    }
+
+    // Bugs caught: 1, False positives: 1
+    #[test]
+    fn exact_half_turns_add_no_turns() {
+        let freq: Vec<f64> = (0..12).map(|i| 100.0 * 1.5f64.powi(i)).collect();
+        let deg: Vec<f64> = (0..12)
+            .map(|i| if i % 2 == 0 { 0.0 } else { 180.0 })
+            .collect();
+        let out = unwrap_phase(&freq, &deg);
+        let (low, high) = out
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, h), d| (l.min(*d), h.max(*d)));
+        assert_eq!(high - low, 180.0, "{out:?}");
+        // A step past a half-turn is still a wrap (then anchored at 400 Hz).
+        let out = unwrap_phase(&[100.0, 200.0, 400.0], &[170.0, -170.0, -150.0]);
+        assert_eq!(out, [-190.0, -170.0, -150.0]);
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_short_phase_range_pads_in_whole_90_degree_steps() {
+        // 10°..20° sits in one 90° step; the axis grows to a turn on 90° lines.
+        let trace = PhaseTrace {
+            freq: vec![100.0, 1000.0, 10_000.0],
+            deg: vec![10.0, 15.0, 20.0],
+            color: 0,
+        };
+        assert_eq!(
+            PhaseAxis::of(&[trace]),
+            PhaseAxis::Unwrapped {
+                top: 180.0,
+                span: 360.0
+            }
+        );
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn phase_labels_thin_out_on_a_short_plot() {
+        let phase = |h, span| PlotBox {
+            span,
+            ..sized(1000.0, h)
+        };
+        assert_eq!(phase_label_step(&phase(600.0, 360.0)), 45.0);
+        assert_eq!(phase_label_step(&phase(60.0, 360.0)), 90.0);
+        // 720° in 60 px: a label every 90° would be 7.5 px apart.
+        assert_eq!(phase_label_step(&phase(60.0, 720.0)), 180.0);
+        // No room at all still ends.
+        assert!(phase_label_step(&phase(0.0, 720.0)).is_finite());
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn nearest_phase_wraps_around() {
+        let at = |deg: f64| PhaseTrace {
+            freq: vec![100.0, 200.0],
+            deg: vec![deg, deg],
+            color: 0,
+        };
+        let traces = [at(0.0), at(-179.0)];
+        assert_eq!(
+            nearest_phase(&traces, 150.0, 179.0, true).unwrap().1,
+            -179.0
+        );
+        // Unwrapped, the gap is plain.
+        assert_eq!(nearest_phase(&traces, 150.0, 179.0, false).unwrap().1, 0.0);
+        assert_eq!(circular_gap(179.0, -179.0), 2.0);
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn phase_readout_follows_the_short_arc() {
+        let trace = |a: f64, b: f64| PhaseTrace {
+            freq: vec![100.0, 400.0],
+            deg: vec![a, b],
+            color: 0,
+        };
+        // Halfway in log f between +170 and -170 is the wrap, not 0.
+        let mid = trace(170.0, -170.0).at(200.0);
+        assert_eq!(mid.abs(), 180.0, "{mid}");
+        // +150 to -100 is 110 degrees the short way round, so halfway is -155.
+        let q = trace(150.0, -100.0).at(200.0);
+        assert!((q + 155.0).abs() < 1e-9, "{q}");
+        // No wrap: plain interpolation.
+        assert!((trace(10.0, 30.0).at(200.0) - 20.0).abs() < 1e-9);
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn labels_are_skipped_on_a_plot_too_short_for_them() {
+        let short = PlotBox {
+            height: LABEL_SIZE - 1.0,
+            ..PlotBox::inside(1000.0, 600.0, INSETS)
+        };
+        assert!(label_rows(&[1.0, 2.0, 3.0], &short).is_none());
+        assert!(label_rows(&[1.0], &short).is_none());
+        let tall = PlotBox::inside(1000.0, 600.0, INSETS);
+        let ys = label_rows(&[tall.top, tall.top], &tall).unwrap();
+        assert!(ys[1] - ys[0] >= LABEL_GAP);
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn percent_readout_uses_scientific_below_a_thousandth() {
+        let d = DistortionPlot {
+            name: String::new(),
+            units: Units::Percent,
+            curves: Vec::new(),
+        };
+        assert_eq!(d.reading(-2.0), "0.010 %");
+        assert_eq!(d.reading((3.2e-5f64).log10()), "3.2e-5 %");
+    }
+
+    // 0.01 % sits on the bottom edge and 100 % on the top one, a decade
+    // apart in between; less than 0.01 % clamps to the bottom.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn percent_axis_maps_decades() {
+        let plot = PlotBox::inside(1000.0, 600.0, INSETS);
+        assert_eq!(percent_y(&plot, 0.01), plot.bottom());
+        assert_eq!(percent_y(&plot, 100.0), plot.top);
+        let step = (plot.bottom() - plot.top) / 4.0;
+        assert!((percent_y(&plot, 1.0) - (plot.top + 2.0 * step)).abs() < 1e-3);
+        assert!((percent_y(&plot, 10.0) - (plot.top + step)).abs() < 1e-3);
+        assert_eq!(percent_y(&plot, 0.0001), plot.bottom());
+        assert_eq!(percent_y(&plot, 0.0), plot.bottom());
+    }
+
+    // A gap in a curve stays a gap on the percent axis: it is not read as
+    // 0 %, which would draw a flat line on the floor and win the hover.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn percent_gaps_stay_gaps() {
+        assert!(percent_axis(f64::NAN).is_nan());
+        assert_eq!(percent_axis(0.0), -12.0);
+        let freq = vec![100.0, 1000.0, 10_000.0, 20_000.0];
+        let fundamental = Response {
+            freq: freq.clone(),
+            db: vec![0.0; 4],
+            phase: None,
+        };
+        let level = Response {
+            freq,
+            db: vec![-40.0, -40.0, f64::NAN, f64::NAN],
+            phase: None,
+        };
+        let curve = Curve::new("H2", Ink::Fg, &level, &fundamental, Units::Percent);
+        assert!(curve.at(1000.0).abs() < 1e-9);
+        assert!(curve.at(15_000.0).is_nan());
+        assert!(curve.at(10_000.0).is_nan());
+        let last = curve.plotted().filter(|(_, y)| y.is_finite()).last();
+        assert_eq!(last.map(|l| l.0), Some(1000.0));
+        let plot = DistortionPlot {
+            name: String::new(),
+            units: Units::Percent,
+            curves: vec![curve],
+        };
+        assert!(plot.nearest(15_000.0, 0.0).is_none());
+    }
+}
