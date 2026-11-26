@@ -652,7 +652,7 @@ mod tests {
         session.shutdown();
     }
 
-    // Bugs caught: 0, False positives: 0
+    // Bugs caught: 0, False positives: 1
     #[test]
     fn reset_starts_afresh_with_the_same_settings() {
         let rate = 48_000;
@@ -668,6 +668,10 @@ mod tests {
         for block in first.chunks(1024) {
             tx.send(block.to_vec()).unwrap();
         }
+        // Audio reaches the session through a forwarder thread while commands
+        // go straight in; give the forwarder time to pass the first stream on
+        // so Reset can't overtake it on a loaded machine.
+        std::thread::sleep(Duration::from_millis(300));
         // ...then a new stream at the same rate: only its own audio counts.
         session.send(SessionCommand::Rate(rate));
         session.send(SessionCommand::Reset);
