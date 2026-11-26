@@ -142,7 +142,7 @@ fn line_points(plot: &PlotBox, graph: &Graph, top: f64) -> Vec<Point> {
 }
 
 /// The width of `content` in `font` at `size`.
-fn text_width(content: &str, font: iced::Font, size: f32) -> f32 {
+pub(super) fn text_width(content: &str, font: iced::Font, size: f32) -> f32 {
     use iced::advanced::text::Paragraph as _;
     let text = iced::advanced::Text {
         content,

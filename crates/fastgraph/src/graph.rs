@@ -110,8 +110,6 @@ const PCT_TOP: f64 = 2.0;
 const PCT_SPAN: f64 = 4.0;
 /// The line width of the THD curve, and the room between curve labels.
 const THD_WIDTH: f32 = 2.5;
-/// Room allowed per character of a curve's name: mono glyphs are about 0.6 em.
-const LABEL_WIDTH_PER_CHAR: f32 = LABEL_SIZE * 0.6;
 const LABEL_GAP: f32 = LABEL_SIZE + 2.0;
 
 /// The y of `percent` on the percent axis `plot` (its span in decades)
@@ -2225,7 +2223,8 @@ fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p
         };
         frame.stroke(&runs_path(&runs), stroke);
         if let (true, Some((from, end))) = (curve.labelled, line_tail(&runs)) {
-            tails.push((from, end, curve.label.chars().count()));
+            let width = export::text_width(&curve.label, theme::mono(), LABEL_SIZE);
+            tails.push((end.y, label_sides(&runs, from, end, width, plot)));
             named.push(curve);
         }
     }
@@ -2260,62 +2259,86 @@ fn curve_runs(curve: &Curve, plot: &PlotBox, top: f64, pin: bool) -> Vec<Vec<Poi
     cut_runs(points, plot, pin)
 }
 
-/// The last segment drawn in `runs`, as its start and its end.
+/// The last segment drawn in `runs` with distinct ends, as its start and its end.
 fn line_tail(runs: &[Vec<Point>]) -> Option<(Point, Point)> {
     runs.iter()
         .rev()
-        .find(|r| r.len() > 1)
-        .map(|r| (r[r.len() - 2], r[r.len() - 1]))
+        .flat_map(|run| run.windows(2).rev())
+        .find(|pair| pair[0] != pair[1])
+        .map(|pair| (pair[0], pair[1]))
 }
 
 /// The heights wanted for the name of a line whose last segment runs `from`
-/// to `end`: just above the end where the line arrives from below (or level),
-/// just below where it arrives from above, so the name's box, which ends at
-/// the right edge, sits clear of the line; the other side is the second
-/// choice. Where the plot has no room on the first side, the order swaps.
-fn label_sides(from: Point, end: Point, chars: usize, plot: &PlotBox) -> [f32; 2] {
-    let off = LABEL_SIZE / 2.0 + THD_WIDTH / 2.0 + 2.0;
-    // The line's height at the name's left edge, where a steep line has
-    // moved furthest from its end.
-    let left = plot.right() - LABEL_WIDTH_PER_CHAR * chars as f32 - 4.0;
-    let at_left = if from.x < left && end.x > from.x {
-        from.y + (end.y - from.y) * (left - from.x) / (end.x - from.x)
-    } else {
-        from.y
+/// to `end`, a name of `width` ending at the right edge: just above the
+/// parts of the line under the name where it arrives from below (or level),
+/// just below where it arrives from above; the other side is the second
+/// choice. A line ending before the name is anchored at its end.
+fn label_sides(
+    runs: &[Vec<Point>],
+    from: Point,
+    end: Point,
+    width: f32,
+    plot: &PlotBox,
+) -> [f32; 2] {
+    let radius = THD_WIDTH / 2.0;
+    let column = PlotBox {
+        left: plot.right() - 4.0 - width - radius,
+        width: width + THD_WIDTH,
+        ..*plot
     };
-    let (above, below) = (end.y.min(at_left) - off, end.y.max(at_left) + off);
-    let fits = |y: f32| y >= plot.top + LABEL_SIZE / 2.0 && y <= plot.bottom() - LABEL_SIZE / 2.0;
-    let order = if from.y >= end.y {
+    let (mut top, mut bottom) = (end.y, end.y);
+    for run in runs {
+        for pair in run.windows(2).rev().take_while(|p| p[1].x >= column.left) {
+            if let Some((a, b, _)) = cut_segment(pair[0], pair[1], &column, false) {
+                top = top.min(a.y).min(b.y);
+                bottom = bottom.max(a.y).max(b.y);
+            }
+        }
+    }
+    let off = LABEL_SIZE / 2.0 + radius + 2.0;
+    let (above, below) = (top - off, bottom + off);
+    if from.y >= end.y {
         [above, below]
     } else {
         [below, above]
-    };
-    if fits(order[0]) || !fits(order[1]) {
-        order
-    } else {
-        [order[1], order[0]]
     }
 }
 
-/// The wanted heights for the names of `tails` (each a line's last segment
-/// and its name's length), in the same order. A name takes its [`label_sides`]
-/// first choice unless another name already wants that spot, so two lines
-/// that end together get one name above and one below instead of one pushed
-/// onto its own line.
-fn label_wishes(tails: &[(Point, Point, usize)], plot: &PlotBox) -> Vec<f32> {
+/// The wanted heights for the names of lines, each given as its end's height
+/// and its two [`label_sides`] rows, in the same order. A name takes the
+/// first row that is inside the plot and clear of the others already taken,
+/// else the other; failing both, the nearest clear row beyond the pair, one
+/// label gap from a taken row. Only when the plot has no such row does it
+/// keep its first choice, for [`label_rows`] to spread.
+fn label_wishes(tails: &[(f32, [f32; 2])], plot: &PlotBox) -> Vec<f32> {
     let mut by_end: Vec<usize> = (0..tails.len()).collect();
-    by_end.sort_by(|a, b| tails[*a].1.y.total_cmp(&tails[*b].1.y));
+    by_end.sort_by(|a, b| tails[*a].0.total_cmp(&tails[*b].0));
     let mut wishes = vec![0.0; tails.len()];
     let mut taken: Vec<f32> = Vec::new();
+    let (low, high) = (
+        plot.top + LABEL_SIZE / 2.0,
+        plot.bottom() - LABEL_SIZE / 2.0,
+    );
     for i in by_end {
-        let (from, end, chars) = tails[i];
-        let [first, other] = label_sides(from, end, chars, plot);
-        let free = |y: f32| taken.iter().all(|t| (t - y).abs() >= LABEL_GAP);
-        let y = if free(first) || !free(other) {
-            first
-        } else {
-            other
-        };
+        let [mut first, mut other] = tails[i].1;
+        if !(low..=high).contains(&first) && (low..=high).contains(&other) {
+            std::mem::swap(&mut first, &mut other);
+        }
+        let free =
+            |y: &f32| (low..=high).contains(y) && taken.iter().all(|t| (t - y).abs() >= LABEL_GAP);
+        let y = [first, other]
+            .into_iter()
+            .find(free)
+            .or_else(|| {
+                let distance = |y: f32| (y - first).abs().min((y - other).abs());
+                taken
+                    .iter()
+                    .flat_map(|&row| [row - LABEL_GAP, row + LABEL_GAP])
+                    .filter(|&row| row <= first.min(other) || row >= first.max(other))
+                    .filter(free)
+                    .min_by(|a, b| distance(*a).total_cmp(&distance(*b)))
+            })
+            .unwrap_or(first);
         taken.push(y);
         wishes[i] = y;
     }
@@ -3634,14 +3657,15 @@ mod tests {
             ),
         ];
         let mut order: Vec<usize> = (0..tails.len()).collect();
-        let wish = label_wishes(
-            &tails.iter().map(|(f, e)| (*f, *e, 3)).collect::<Vec<_>>(),
-            &plot,
-        );
+        let width = export::text_width("THD", theme::mono(), LABEL_SIZE);
+        let sides = tails.map(|(from, end)| {
+            let runs = [vec![from, end]];
+            (end.y, label_sides(&runs, from, end, width, &plot))
+        });
+        let wish = label_wishes(&sides, &plot);
         order.sort_by(|a, b| wish[*a].total_cmp(&wish[*b]));
         let sorted: Vec<f32> = order.iter().map(|i| wish[*i]).collect();
         let rows = label_rows(&sorted, &plot).unwrap();
-        let width = 3.0 * LABEL_WIDTH_PER_CHAR;
         let boxes: Vec<(usize, Rectangle)> = order
             .iter()
             .zip(&rows)
@@ -3671,6 +3695,126 @@ mod tests {
         }
         for pair in boxes.windows(2) {
             assert!(pair[1].1.y >= pair[0].1.y + pair[0].1.height, "{pair:?}");
+        }
+    }
+
+    /// The rows `label_wishes` and `label_rows` give names ending at `ends`.
+    fn rows_for(plot: &PlotBox, tails: &[Vec<Point>]) -> Vec<f32> {
+        let width = export::text_width("H2", theme::mono(), LABEL_SIZE);
+        let sides: Vec<(f32, [f32; 2])> = tails
+            .iter()
+            .map(|run| {
+                let runs = [run.clone()];
+                let (from, end) = line_tail(&runs).unwrap();
+                (end.y, label_sides(&runs, from, end, width, plot))
+            })
+            .collect();
+        let wish = label_wishes(&sides, plot);
+        let mut order: Vec<usize> = (0..wish.len()).collect();
+        order.sort_by(|a, b| wish[*a].total_cmp(&wish[*b]));
+        let rows = label_rows(&order.iter().map(|i| wish[*i]).collect::<Vec<_>>(), plot).unwrap();
+        let mut out = vec![0.0; wish.len()];
+        for (i, y) in order.into_iter().zip(rows) {
+            out[i] = y;
+        }
+        out
+    }
+
+    // A harmonic that ends before the name stays level with its end; a curve
+    // bending under the name is cleared by the name's box at every sample.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn distortion_names_clear_the_segments_under_them() {
+        let plot = sized(500.0, 300.0);
+        let width = export::text_width("H2", theme::mono(), LABEL_SIZE);
+        let y = plot.top + 150.0;
+        let early = vec![
+            Point::new(plot.left + 100.0, y + 1.0),
+            Point::new(plot.left + 101.0, y),
+        ];
+        let [first, _] = label_sides(
+            std::slice::from_ref(&early),
+            early[0],
+            early[1],
+            width,
+            &plot,
+        );
+        assert!((first - y).abs() < LABEL_SIZE, "{first}");
+        // A falling line with a bump under the name: the end alone would
+        // put the name on the bump.
+        let right = plot.right();
+        let bend: Vec<Point> = (0..=20)
+            .map(|k| {
+                let x = right - 100.0 + 5.0 * k as f32;
+                let bump = if (17..=18).contains(&k) { -40.0 } else { 0.0 };
+                Point::new(x, y + bump)
+            })
+            .collect();
+        let rows = rows_for(&plot, std::slice::from_ref(&bend));
+        let (top, bottom) = (rows[0] - LABEL_SIZE / 2.0, rows[0] + LABEL_SIZE / 2.0);
+        let left = right - 4.0 - width;
+        for pair in bend.windows(2) {
+            if let Some((a, b, _)) = cut_segment(
+                pair[0],
+                pair[1],
+                &PlotBox {
+                    left,
+                    width: width + 4.0,
+                    ..plot
+                },
+                false,
+            ) {
+                let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
+                assert!(
+                    hi < top - 1.0 || lo > bottom + 1.0,
+                    "{a:?} {b:?} in {rows:?}"
+                );
+            }
+        }
+    }
+
+    // The arrival slope comes from the last pair of distinct points, past
+    // repeated points and runs that only touch the clip edge.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn line_tail_skips_zero_length_segments() {
+        let (a, b) = (Point::new(0.0, 5.0), Point::new(10.0, 9.0));
+        assert_eq!(line_tail(&[vec![a, b, b]]), Some((a, b)));
+        assert_eq!(line_tail(&[vec![a, b], vec![b, b]]), Some((a, b)));
+        assert_eq!(line_tail(&[vec![a, b], vec![b]]), Some((a, b)));
+        assert_eq!(line_tail(&[vec![b, b]]), None);
+    }
+
+    // Three labels ending at one level take distinct rows, none on the
+    // line, and two at the top edge stay inside the plot.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn crowded_names_find_a_clear_row() {
+        let plot = sized(500.0, 300.0);
+        let right = plot.right();
+        let level = |y: f32| vec![Point::new(right - 60.0, y), Point::new(right, y)];
+        let y = plot.top + 150.0;
+        let rows = rows_for(&plot, &[level(y), level(y), level(y)]);
+        for r in &rows {
+            assert!(
+                (r - y).abs() >= LABEL_SIZE / 2.0 + THD_WIDTH / 2.0,
+                "{rows:?}"
+            );
+        }
+        let mut sorted = rows.clone();
+        sorted.sort_by(f32::total_cmp);
+        assert!(
+            sorted.windows(2).all(|w| w[1] - w[0] >= LABEL_GAP),
+            "{rows:?}"
+        );
+        let top = plot.top;
+        let rows = rows_for(&plot, &[level(top), level(top)]);
+        for r in &rows {
+            assert!(*r >= plot.top + LABEL_SIZE / 2.0, "{rows:?}");
+            assert!(
+                (r - top).abs() >= LABEL_SIZE / 2.0 + THD_WIDTH / 2.0,
+                "{rows:?}"
+            );
         }
     }
 
