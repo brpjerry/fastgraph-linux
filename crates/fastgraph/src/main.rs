@@ -8,6 +8,7 @@ mod app;
 mod browser;
 mod devices;
 mod distortion;
+mod export_png;
 mod graph;
 mod list;
 mod plot;

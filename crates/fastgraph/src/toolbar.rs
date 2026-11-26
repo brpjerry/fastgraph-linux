@@ -86,9 +86,51 @@ pub fn comp_label(path: Option<&PathBuf>, loaded: bool) -> String {
     format!("Comp: {name}")
 }
 
-/// The controls (four fixed groups in a wrapping row) and the import and
-/// average buttons, which sit on the tabs' line.
-pub fn view(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
+/// The tabs' line's buttons, Export PNG… last, and their padding.
+const LINE_ONE: [&str; 3] = ["Import…", "Average shown", PNG_LABEL];
+pub const PNG_LABEL: &str = "Export PNG…";
+const BUTTON_PAD: f32 = 10.0;
+/// Room between the buttons, and between the tabs and them.
+const LINE_ONE_SPACING: f32 = 10.0;
+
+/// The width of a button label at the body size.
+fn label_width(content: &str) -> f32 {
+    use iced::advanced::text::Paragraph as _;
+    let text = iced::advanced::Text {
+        content,
+        bounds: iced::Size::new(f32::INFINITY, f32::INFINITY),
+        size: theme::TEXT.into(),
+        line_height: text::LineHeight::default(),
+        font: theme::ui(),
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Center,
+        shaping: text::Shaping::default(),
+        wrapping: text::Wrapping::None,
+    };
+    iced::advanced::graphics::text::Paragraph::with_text(text)
+        .min_bounds()
+        .width
+}
+
+/// Whether Export PNG… fits on the tabs' line of `width` beside the tabs
+/// at their full `tabs` width; else it ends the controls, so the tabs keep
+/// their width.
+pub fn png_on_tabs_line(width: f32, tabs: f32) -> bool {
+    // The labels and the font are fixed: measured once.
+    static BUTTONS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let buttons = BUTTONS.get_or_init(|| {
+        LINE_ONE
+            .iter()
+            .map(|l| label_width(l).ceil() + 2.0 * BUTTON_PAD + 1.0)
+            .sum()
+    });
+    tabs + LINE_ONE_SPACING * LINE_ONE.len() as f32 + buttons <= width
+}
+
+/// The controls (four fixed groups in a wrapping row) and the import,
+/// average and Export PNG… buttons, which sit on the tabs' line; Export
+/// PNG… ends the controls instead when it is not `on_tabs_line`.
+pub fn view(app: &App, on_tabs_line: bool) -> (Element<'_, Message>, Element<'_, Message>) {
     let shown = app.items.iter().filter(|i| i.shown).count();
     // Compensation, align and offset change the level, not the phase, and
     // the Distortion view has its own curves: their controls rest there.
@@ -152,23 +194,31 @@ pub fn view(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
     .spacing(10)
     .align_y(Alignment::Center);
     let units = units_toggle(app.units, app.graph_view == graph::View::Distortion);
+    let png = crate::export_png::button_view();
+    let (png_controls, png_actions) = if on_tabs_line {
+        (None, Some(png))
+    } else {
+        (Some(png), None)
+    };
     let controls = row![smoothing, compensation, align, units]
+        .extend(png_controls)
         .spacing(24)
         .align_y(Alignment::Center)
         .width(Length::Fill)
         .wrap()
         .vertical_spacing(8);
     let actions = row![
-        button(text("Import…"))
+        button(text(LINE_ONE[0]))
             .on_press(Message::Import)
-            .padding([4, 10])
+            .padding([4.0, BUTTON_PAD])
             .style(theme::button),
-        button(text("Average shown"))
+        button(text(LINE_ONE[1]))
             .on_press_maybe((shown >= 2).then_some(Message::AverageShown))
-            .padding([4, 10])
+            .padding([4.0, BUTTON_PAD])
             .style(theme::button),
     ]
-    .spacing(10)
+    .extend(png_actions)
+    .spacing(LINE_ONE_SPACING)
     .align_y(Alignment::Center);
     (controls.into(), actions.into())
 }

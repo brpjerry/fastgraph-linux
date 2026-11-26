@@ -4,14 +4,14 @@
 //! result comes back as a message.
 use crate::app::Message;
 use std::panic::AssertUnwindSafe;
-use std::sync::mpsc;
+use std::sync::{Arc, Weak, mpsc};
 use std::thread::JoinHandle;
 
 /// A piece of work and the message it reports, if any.
 pub type Job = Box<dyn FnOnce() -> Option<Message> + Send>;
 
 pub struct Worker {
-    jobs: Option<mpsc::Sender<Job>>,
+    jobs: Option<Arc<mpsc::Sender<Job>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -41,9 +41,15 @@ impl Worker {
             })
             .expect("spawn the worker thread");
         Worker {
-            jobs: Some(jobs),
+            jobs: Some(Arc::new(jobs)),
             thread: Some(thread),
         }
+    }
+
+    /// A handle that queues jobs while the worker runs, without keeping it
+    /// running: once [`Worker::finish`] begins, it queues nothing.
+    pub fn sender(&self) -> Weak<mpsc::Sender<Job>> {
+        self.jobs.as_ref().map(Arc::downgrade).unwrap_or_default()
     }
 
     /// Queue `job` after every one before it.
