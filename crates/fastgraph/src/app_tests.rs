@@ -1538,6 +1538,16 @@ fn render_snapshots() {
             app.now += Duration::from_secs(1);
             snapshot(&app, &format!("{tag}-measure-{name}"));
         }
+        // Zoomed in %: Reset view, the finer grid and its labels in this
+        // appearance's colours.
+        run(
+            &mut app,
+            wheel(graph::Axis::Frequency, plot.right() - 50.0, 3.0),
+        );
+        run(&mut app, wheel(graph::Axis::Level, plot.top + 300.0, 3.0));
+        run(&mut app, hover(15_000.0, 0.5));
+        snapshot(&app, &format!("{tag}-measure-distortion-zoomed"));
+        run(&mut app, Message::Graph(graph::Event::Reset));
         run(&mut app, Message::GraphViewSelected(graph::View::Response));
         for (pane, name) in [(Pane::Sets, "sets"), (Pane::Settings, "settings")] {
             run(&mut app, Message::PaneSelected(pane));
