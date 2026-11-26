@@ -95,7 +95,10 @@ pub fn write_rew(resp: &Response, header: &ExportHeader) -> String {
     if header.offset_db != 0.0 {
         out.push_str(&format!("* Offset: {:+.1} dB\n", header.offset_db));
     }
-    out.push_str(&format!("* Dated: {}\n", local_time_string(header.created)));
+    out.push_str(&format!(
+        "* Dated: {}\n",
+        one_line(&local_time_string(header.created))
+    ));
     out.push_str("*\n");
     out.push_str(if phase.is_some() {
         "* Freq(Hz) SPL(dB) Phase(degrees)\n"
@@ -126,21 +129,25 @@ pub fn local_time_string(t: SystemTime) -> String {
     };
     let format: &[u8] = b"%x %X\0";
     let time = secs as libc::time_t;
-    // SAFETY: `tm` is plain data that `localtime_r` fills in, and `buf` is
-    // large enough for `strftime`, which reports how many bytes it wrote.
+    // SAFETY: `localtime_r` fills `tm`, and `strftime` writes at most
+    // `buf.len()` bytes and reports how many.
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&time, &mut tm).is_null() {
             return "unknown time".to_owned();
         }
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 256];
         let n = libc::strftime(
             buf.as_mut_ptr().cast(),
             buf.len(),
             format.as_ptr().cast(),
             &tm,
         );
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        // 0 means the text did not fit; non-UTF-8 comes from a legacy locale.
+        match std::str::from_utf8(&buf[..n]) {
+            Ok(text) if n > 0 => text.to_owned(),
+            _ => "unknown time".to_owned(),
+        }
     }
 }
 
