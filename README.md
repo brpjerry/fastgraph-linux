@@ -165,8 +165,11 @@ at that frequency, loudest first. The Phase and Distortion views show the neares
 To zoom, scroll over the frequency labels under the graph, or over the level labels to its left.
 The zoom centres on the pointer, from 20 Hz–20 kHz down to a third of an octave, and from twice
 the automatic level range down to 5 dB (10° in Phase, one decade in Distortion %). Each view
-keeps its own zoom. **Reset view**, in the graph's top-right corner while the view is zoomed,
-returns it to the automatic axes. **Clear** resets every view.
+keeps its own zoom. To pan a zoomed axis, drag the plot with the middle mouse button, or use the
+scroll bars that appear under the frequency labels and right of the plot: drag a thumb, or click
+a track to move by one screen. Panning stops at 20 Hz–20 kHz and at the level axis's zoomed-out
+range. **Reset view**, in the graph's top-right corner while the view is zoomed, returns it to the
+automatic axes. **Clear** resets every view.
 
 ### Clear
 

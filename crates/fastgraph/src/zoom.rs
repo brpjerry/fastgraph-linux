@@ -2,6 +2,9 @@
 //! notch over the axis moves it. The frequency axis is zoomed in decades
 //! (log10 Hz); a level axis in its own units (dB, degrees, or the decades
 //! of a percentage). Free of any UI type so it can be unit-tested.
+//!
+//! A zoomed axis also pans, within its full range: by a drag on the plot,
+//! or on its scroll bar, whose thumb shows the stretch in view.
 use crate::plot::{F_MAX, F_MIN};
 
 /// The span changes by this factor per wheel notch.
@@ -121,6 +124,59 @@ pub fn zoom(range: Range, at: f64, factor: f64, limits: &Limits) -> Option<Range
     let low = at - (at - range.low) * k;
     let zoomed = Range::new(low, low + span).kept_in(limits.full);
     (zoomed.usable() && !zoomed.is(limits.default)).then_some(zoomed)
+}
+
+/// `range` moved by `shift` along its axis, kept inside the full range of
+/// `limits`; `None` when that is the default, as for [`zoom`], or when the
+/// result has no finite positive span.
+pub fn pan(range: Range, shift: f64, limits: &Limits) -> Option<Range> {
+    let moved = Range::new(range.low + shift, range.high + shift).kept_in(limits.full);
+    (moved.usable() && !moved.is(limits.default)).then_some(moved)
+}
+
+/// The shortest a scroll bar's thumb is drawn, in pixels, so a deep zoom
+/// still leaves something to grab.
+pub const MIN_THUMB: f32 = 16.0;
+
+/// The thumb of a scroll bar `length` pixels long over `full`, with `shown`
+/// in view: its start, from the bar's low end, and its length. It is as
+/// long as the share of `full` in view, but at least [`MIN_THUMB`]; a
+/// range beyond `full` puts it on that end.
+pub fn thumb(shown: Range, full: Range, length: f32) -> (f32, f32) {
+    let share = (shown.span() / full.span()).clamp(0.0, 1.0) as f32;
+    let size = (share * length).max(MIN_THUMB).min(length);
+    let room = full.span() - shown.span();
+    let along = if room > 0.0 {
+        ((shown.low - full.low) / room).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    (along * (length - size), size)
+}
+
+/// How far a drag of the thumb by `pixels` along the bar (toward its high
+/// end positive) moves `shown`, so the thumb follows the pointer.
+pub fn thumb_shift(shown: Range, full: Range, length: f32, pixels: f32) -> f64 {
+    let (_, size) = thumb(shown, full, length);
+    let travel = length - size;
+    let room = full.span() - shown.span();
+    if travel <= 0.0 || room <= 0.0 {
+        return 0.0;
+    }
+    f64::from(pixels / travel) * room
+}
+
+/// Which way a click on a scroll bar's track at `at` pixels from its low
+/// end pages: by one span in view toward the click, none on the thumb.
+pub fn page(shown: Range, full: Range, length: f32, at: f32) -> f64 {
+    let (start, size) = thumb(shown, full, length);
+    if at < start {
+        -shown.span()
+    } else if at > start + size {
+        shown.span()
+    } else {
+        0.0
+    }
 }
 
 /// A view's zoom: each axis's range, `None` at its default fit.
@@ -269,5 +325,73 @@ mod tests {
             Range::new(-5.0, 25.0).kept_in(full),
             Range::new(-10.0, 20.0)
         );
+    }
+
+    // Panning moves a range whole, and stops at the full range's ends: in
+    // decades for frequency, so 20 Hz and 20 kHz are exact.
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn panning_stops_at_the_full_range() {
+        let limits = Limits::frequency();
+        let shown = Range::new(2.0, 3.0);
+        let up = pan(shown, 0.4, &limits).unwrap();
+        assert_eq!(up, Range::new(2.4, 3.4));
+        let top = pan(shown, 10.0, &limits).unwrap();
+        assert_eq!(top.high, F_MAX.log10());
+        assert!(close(top.span(), 1.0));
+        let bottom = pan(shown, -10.0, &limits).unwrap();
+        assert_eq!(bottom.low, F_MIN.log10());
+        assert!(close(bottom.span(), 1.0));
+        // A level axis: within twice its fit, about the fit's centre.
+        let limits = Limits::level(Range::new(40.0, 90.0), 5.0);
+        let shown = Range::new(60.0, 70.0);
+        assert_eq!(pan(shown, 1e3, &limits), Some(Range::new(105.0, 115.0)));
+        assert_eq!(pan(shown, -1e3, &limits), Some(Range::new(15.0, 25.0)));
+        assert_eq!(pan(shown, -5.0, &limits), Some(Range::new(55.0, 65.0)));
+        // Panned onto the fit, it is no longer zoomed.
+        let fit_wide = Range::new(30.0, 80.0);
+        assert_eq!(pan(fit_wide, 10.0, &limits), None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_thumb_shows_the_share_in_view() {
+        let full = Range::new(0.0, 10.0);
+        // A quarter in view, a third of the way along the room left.
+        let (start, size) = thumb(Range::new(2.5, 5.0), full, 400.0);
+        assert!((size - 100.0).abs() < 1e-3);
+        assert!((start - 100.0).abs() < 1e-3);
+        // At either end.
+        assert_eq!(thumb(Range::new(0.0, 5.0), full, 400.0), (0.0, 200.0));
+        let (start, size) = thumb(Range::new(5.0, 10.0), full, 400.0);
+        assert!((start + size - 400.0).abs() < 1e-3);
+        // Deep in, the thumb keeps its least length, and still reaches the
+        // track's far end.
+        let (start, size) = thumb(Range::new(9.999, 10.0), full, 400.0);
+        assert_eq!(size, MIN_THUMB);
+        assert!((start + size - 400.0).abs() < 1e-3);
+        // A range beyond the full one sits on its end.
+        assert_eq!(thumb(Range::new(-3.0, -1.0), full, 400.0).0, 0.0);
+        // A drag of the thumb moves the range as far as the thumb moves.
+        let shown = Range::new(2.5, 5.0);
+        let moved = shown.low + thumb_shift(shown, full, 400.0, 30.0);
+        let (start, _) = thumb(Range::new(moved, moved + 2.5), full, 400.0);
+        assert!((start - 130.0).abs() < 1e-3, "{start}");
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_click_on_the_track_pages_by_one_span() {
+        let full = Range::new(0.0, 10.0);
+        let shown = Range::new(2.5, 5.0);
+        // The thumb covers 100..200 of 400 px.
+        assert_eq!(page(shown, full, 400.0, 50.0), -2.5);
+        assert_eq!(page(shown, full, 400.0, 350.0), 2.5);
+        assert_eq!(page(shown, full, 400.0, 150.0), 0.0);
+        // Paged past the end, it stops there.
+        let limits = Limits::level(Range::new(2.5, 7.5), 1.0);
+        let near = Range::new(6.0, 8.5);
+        let paged = pan(near, page(near, full, 400.0, 399.0), &limits).unwrap();
+        assert_eq!(paged, Range::new(7.5, 10.0));
     }
 }
