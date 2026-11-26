@@ -12,7 +12,7 @@ use fastgraph_core::prefs::{ALIGN_WIDTHS, format_hz, parse_hz};
 use fastgraph_core::response::{Response, Smoothing, average};
 use fastgraph_core::set::safe_file_name;
 use fastgraph_core::store::{Kind, Measurement, Meta, Store};
-use iced::widget::{button, checkbox, container, pick_list, row, text, text_input, tooltip};
+use iced::widget::{button, checkbox, pick_list, row, text, text_input, tooltip};
 use iced::{Alignment, Element, Length, Task};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -123,7 +123,9 @@ pub fn view(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
         .width(COMP_WIDTH)
         .style(theme::button);
     let compensation = row![
-        tooltip(comp_button, text(full), tooltip::Position::Bottom).style(container::bordered_box),
+        tooltip(comp_button, text(full), tooltip::Position::Bottom)
+            .padding(4)
+            .style(theme::card),
         checkbox(app.prefs.comp_enabled)
             .label("Apply")
             .on_toggle_maybe(loaded.then_some(Message::CompensationEnabled))

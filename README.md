@@ -190,6 +190,8 @@ Your settings are kept. Unsaved work stays available under **Unsaved sessions**.
   Leave a folder empty to use the default (see Files). `~/` is accepted; other relative paths
   are not.
 - **Ask where to save** and **Ask where to export**: show a file dialog for Save and Export.
+- **Appearance**: **Dark** (the default) or **Light**. It applies at once. In Light, the
+  default accent and trace colours are darker so they read on white; colours you set are kept.
 - **Accent colour** and **Trace colours**: `#rrggbb` values, each with a **Reset** button.
 
 ### Keyboard

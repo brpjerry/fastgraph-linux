@@ -1,13 +1,13 @@
-//! The Settings tab: the sets and exports folders, the "ask" boxes, the accent
-//! colour and the trace colours. Text boxes keep what was typed in
-//! [`Inputs`]; only a valid entry reaches the preferences.
+//! The Settings tab: the sets and exports folders, the "ask" boxes, the
+//! appearance, the accent colour and the trace colours. Text boxes keep what
+//! was typed in [`Inputs`]; only a valid entry reaches the preferences.
 use crate::app::{App, Message};
-use crate::theme::{self, Palette, TRACE_COLOURS};
+use crate::theme::{self, Palette, TRACE_COLOURS, ThemeMode};
 use crate::{devices, theme::parse_hex, theme::to_hex};
 use fastgraph_core::prefs::Prefs;
 use fastgraph_core::prefs::format_hz;
 use iced::widget::{button, checkbox, column, container, row, scrollable, space, text, text_input};
-use iced::{Alignment, Color, Element, Length, Task};
+use iced::{Alignment, Element, Length, Task};
 use std::path::PathBuf;
 
 /// The text boxes as typed.
@@ -21,13 +21,6 @@ pub struct Inputs {
     pub traces: [String; TRACE_COLOURS],
 }
 
-/// The trace colours the preferences set, if they set all eight validly.
-pub fn trace_colors(prefs: &Prefs) -> Option<[Color; TRACE_COLOURS]> {
-    let list = prefs.trace_colors.as_ref()?;
-    let colors: Vec<Color> = list.iter().map(|c| parse_hex(c)).collect::<Option<_>>()?;
-    colors.try_into().ok()
-}
-
 fn path_text(dir: &Option<PathBuf>) -> String {
     dir.as_ref()
         .map_or_else(String::new, |d| d.display().to_string())
@@ -35,14 +28,7 @@ fn path_text(dir: &Option<PathBuf>) -> String {
 
 /// The palette the preferences describe.
 fn palette(prefs: &Prefs) -> Palette {
-    let accent = prefs.accent.as_deref().and_then(parse_hex);
-    Palette::new(accent.unwrap_or(theme::ACCENT), trace_colors(prefs))
-}
-
-/// The theme the preferences describe.
-pub fn build_theme(prefs: &Prefs) -> iced::Theme {
-    let accent = prefs.accent.as_deref().and_then(parse_hex);
-    theme::with_colors(accent.unwrap_or(theme::ACCENT), trace_colors(prefs))
+    Palette::from_prefs(prefs)
 }
 
 impl Inputs {
@@ -137,6 +123,18 @@ impl App {
                 self.prefs.ask_export = on;
                 self.save_prefs();
             }
+            Message::ThemePicked(mode) => {
+                if self.prefs.theme != mode {
+                    self.prefs.theme = mode;
+                    self.save_prefs();
+                    // The default accent and traces are the mode's own.
+                    if self.prefs.accent.is_none() {
+                        self.settings.accent = to_hex(palette(&self.prefs).accent);
+                    }
+                    self.sync_default_traces();
+                    self.apply_colors();
+                }
+            }
             Message::AccentInput(text) => self.settings.accent = text,
             Message::AccentSubmit => {
                 if let Some(color) = parse_hex(&self.settings.accent) {
@@ -180,10 +178,10 @@ impl App {
         Task::none()
     }
 
-    /// Install the colours the preferences name: the graph's cached strokes
-    /// have the old ones.
+    /// Install the mode and colours the preferences name: the graph's cached
+    /// strokes have the old ones.
     fn apply_colors(&mut self) {
-        self.theme = build_theme(&self.prefs);
+        self.theme = theme::from_prefs(&self.prefs);
         self.graph.colors_changed();
     }
 
@@ -283,6 +281,17 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .spacing(8),
         );
     }
+    let appearance = column![
+        devices::heading("Appearance"),
+        row(
+            [("Dark", ThemeMode::Dark), ("Light", ThemeMode::Light)].map(|(label, mode)| {
+                devices::segment(label, prefs.theme == mode, Some(Message::ThemePicked(mode)))
+            })
+        )
+        .spacing(4)
+        .width(Length::Fixed(160.0)),
+    ]
+    .spacing(6);
     let content = column![
         folder_section(Folder {
             label: "Sets folder",
@@ -304,6 +313,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             browse: Message::BrowseExportsDir,
             toggle: Message::AskExport,
         }),
+        appearance,
         column![
             devices::heading("Accent colour"),
             row![

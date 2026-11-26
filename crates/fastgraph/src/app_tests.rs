@@ -2,6 +2,7 @@
 use super::*;
 use crate::browser::Pane;
 use crate::rta_mode::Sent;
+use crate::theme::{Palette, ThemeMode};
 use fastgraph_core::deconv::ImpulseResponse;
 use fastgraph_core::response::{Response, Smoothing, average, log_grid};
 use fastgraph_core::store::Kind;
@@ -1500,6 +1501,47 @@ fn render_snapshots() {
             snapshot_sized(&app, &format!("header-{name}-{width}"), (width, 800.0));
         }
     }
+
+    // Every tab and graph view in both appearances.
+    let saves = tempfile::tempdir().unwrap();
+    for name in ["Velour pads", "Leather pads"] {
+        write_pads(saves.path(), name, "Left");
+    }
+    app.prefs.sets_dir = Some(saves.path().to_path_buf());
+    for n in 0..app.items.len() {
+        let item = id(&app, n);
+        app.distortion
+            .insert(item, distortion_at(-60.0 + 10.0 * n as f64));
+    }
+    // A selected row, and a hover card on each plot.
+    let first = id(&app, 0);
+    run(&mut app, Message::Select(first));
+    for (mode, tag) in [(ThemeMode::Dark, "dark"), (ThemeMode::Light, "light")] {
+        run(&mut app, Message::ThemePicked(mode));
+        run(&mut app, Message::PaneSelected(Pane::Measure));
+        for (view, name, hover) in [
+            (graph::View::Response, "response", 4.0),
+            (graph::View::Phase, "phase", -90.0),
+            (graph::View::Distortion, "distortion", -60.0),
+        ] {
+            run(&mut app, Message::GraphViewSelected(view));
+            run(
+                &mut app,
+                Message::Graph(graph::Event::Hover(graph::Hover::At {
+                    freq: 2900.0,
+                    db: hover,
+                })),
+            );
+            app.now += Duration::from_secs(1);
+            snapshot(&app, &format!("{tag}-measure-{name}"));
+        }
+        run(&mut app, Message::GraphViewSelected(graph::View::Response));
+        for (pane, name) in [(Pane::Sets, "sets"), (Pane::Settings, "settings")] {
+            run(&mut app, Message::PaneSelected(pane));
+            app.now += Duration::from_secs(1);
+            snapshot(&app, &format!("{tag}-{name}"));
+        }
+    }
 }
 
 // Bugs caught: 0, False positives: 1
@@ -2546,11 +2588,69 @@ fn settings_tab_renders_its_sections() {
     for label in [
         "Sets folder",
         "Exports folder",
+        "Appearance",
+        "Dark",
+        "Light",
         "Accent colour",
         "Trace colours",
     ] {
         assert!(crate::testing::shows(app.view(), label), "{label}");
     }
+}
+
+// Bugs caught: 0, False positives: 0
+#[test]
+fn the_appearance_segments_pick_the_mode() {
+    let mut app = plain(None);
+    run(&mut app, Message::PaneSelected(Pane::Settings));
+    let sent = click(app.view(), "Light");
+    assert!(
+        matches!(sent[..], [Message::ThemePicked(ThemeMode::Light)]),
+        "{sent:?}"
+    );
+}
+
+// The mode applies at once: a new theme, the light palette, the mode's
+// default colours in the boxes, and the graph's cached strokes redrawn.
+// Bugs caught: 0, False positives: 0
+#[test]
+fn switching_the_appearance_rebuilds_the_theme_and_redraws_the_graph() {
+    let mut app = plain(None);
+    heard(&mut app, 0.0, false);
+    let draws = |app: &App| {
+        crate::testing::ui(crate::testing::SIZE, app.view())
+            .snapshot(&app.theme())
+            .expect("headless render");
+        app.graph.drawn.get()
+    };
+    let dark = Palette::of(&app.theme());
+    assert_eq!(dark, Palette::default());
+    let before = draws(&app);
+
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    assert_eq!(app.prefs.theme, ThemeMode::Light);
+    let light = Palette::of(&app.theme());
+    assert_eq!(light, Palette::from_prefs(&app.prefs));
+    assert_ne!(light.bg, dark.bg);
+    assert_eq!(light.accent, theme::ACCENT_LIGHT);
+    assert_eq!(app.settings.accent, theme::to_hex(theme::ACCENT_LIGHT));
+    assert_eq!(app.settings.traces, light.traces.map(theme::to_hex));
+    let after = draws(&app);
+    assert_eq!(after, before + 1, "redrawn in the light colours");
+    // Picking the shown mode again changes nothing.
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    assert_eq!(draws(&app), after);
+
+    // A custom accent stays through a switch back.
+    run(&mut app, Message::AccentInput("#30a0f0".into()));
+    run(&mut app, Message::AccentSubmit);
+    let custom = draws(&app);
+    run(&mut app, Message::ThemePicked(ThemeMode::Dark));
+    let p = Palette::of(&app.theme());
+    assert_eq!(p.bg, dark.bg);
+    assert_eq!(Some(p.accent), theme::parse_hex("#30a0f0"));
+    assert_eq!(app.settings.accent, "#30a0f0");
+    assert_eq!(draws(&app), custom + 1);
 }
 
 /// A response tilting 6 dB per octave through 0 dB at 1 kHz.
@@ -2911,7 +3011,7 @@ fn selecting_a_row_highlights_it() {
     run(&mut app, sent.into_iter().next().unwrap());
     assert_eq!(app.selected, Some(want.clone()));
     let p = theme::Palette::default();
-    let theme = theme::with_colors(theme::ACCENT, None);
+    let theme = theme::with_colors(ThemeMode::Dark, theme::ACCENT, None);
     assert_eq!(
         theme::row_fill(true)(&theme).background,
         Some(p.selected.into())
