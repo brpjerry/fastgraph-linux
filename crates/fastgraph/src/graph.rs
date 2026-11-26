@@ -110,6 +110,8 @@ const PCT_TOP: f64 = 2.0;
 const PCT_SPAN: f64 = 4.0;
 /// The line width of the THD curve, and the room between curve labels.
 const THD_WIDTH: f32 = 2.5;
+/// Room allowed per character of a curve's name: mono glyphs are about 0.6 em.
+const LABEL_WIDTH_PER_CHAR: f32 = LABEL_SIZE * 0.6;
 const LABEL_GAP: f32 = LABEL_SIZE + 2.0;
 
 /// The y of `percent` on the percent axis `plot` (its span in decades)
@@ -2203,7 +2205,7 @@ fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p
         Ink::Fg => p.fg,
         Ink::Dim => p.fg_dim,
     };
-    let mut ends = Vec::new();
+    let (mut tails, mut named) = (Vec::new(), Vec::new());
     for curve in &d.curves {
         let runs = curve_runs(curve, plot, top, graph.pins());
         let width = if curve.thick { THD_WIDTH } else { TRACE_WIDTH };
@@ -2222,12 +2224,14 @@ fn draw_distortion(frame: &mut Frame, plot: &PlotBox, graph: &Graph, top: f64, p
                 .with_line_join(canvas::LineJoin::Round)
         };
         frame.stroke(&runs_path(&runs), stroke);
-        if let (true, Some(end)) = (curve.labelled, line_end(&runs)) {
-            ends.push((end.y, curve));
+        if let (true, Some((from, end))) = (curve.labelled, line_tail(&runs)) {
+            tails.push((from, end, curve.label.chars().count()));
+            named.push(curve);
         }
     }
-    // Names at the right end of their curves, spread so they stay apart and
-    // inside the plot.
+    // Names at the right end of their curves, clear of their lines, spread so
+    // they stay apart and inside the plot.
+    let mut ends: Vec<(f32, &Curve)> = label_wishes(&tails, plot).into_iter().zip(named).collect();
     ends.sort_by(|a, b| a.0.total_cmp(&b.0));
     let wanted: Vec<f32> = ends.iter().map(|(y, _)| *y).collect();
     let Some(ys) = label_rows(&wanted, plot) else {
@@ -2256,13 +2260,66 @@ fn curve_runs(curve: &Curve, plot: &PlotBox, top: f64, pin: bool) -> Vec<Vec<Poi
     cut_runs(points, plot, pin)
 }
 
-/// Where the line of `runs` ends on the right: the last point drawn, an
-/// edge crossing included. `None` when no line is drawn.
-fn line_end(runs: &[Vec<Point>]) -> Option<Point> {
+/// The last segment drawn in `runs`, as its start and its end.
+fn line_tail(runs: &[Vec<Point>]) -> Option<(Point, Point)> {
     runs.iter()
         .rev()
-        .filter(|r| r.len() > 1)
-        .find_map(|r| r.last().copied())
+        .find(|r| r.len() > 1)
+        .map(|r| (r[r.len() - 2], r[r.len() - 1]))
+}
+
+/// The heights wanted for the name of a line whose last segment runs `from`
+/// to `end`: just above the end where the line arrives from below (or level),
+/// just below where it arrives from above, so the name's box, which ends at
+/// the right edge, sits clear of the line; the other side is the second
+/// choice. Where the plot has no room on the first side, the order swaps.
+fn label_sides(from: Point, end: Point, chars: usize, plot: &PlotBox) -> [f32; 2] {
+    let off = LABEL_SIZE / 2.0 + THD_WIDTH / 2.0 + 2.0;
+    // The line's height at the name's left edge, where a steep line has
+    // moved furthest from its end.
+    let left = plot.right() - LABEL_WIDTH_PER_CHAR * chars as f32 - 4.0;
+    let at_left = if from.x < left && end.x > from.x {
+        from.y + (end.y - from.y) * (left - from.x) / (end.x - from.x)
+    } else {
+        from.y
+    };
+    let (above, below) = (end.y.min(at_left) - off, end.y.max(at_left) + off);
+    let fits = |y: f32| y >= plot.top + LABEL_SIZE / 2.0 && y <= plot.bottom() - LABEL_SIZE / 2.0;
+    let order = if from.y >= end.y {
+        [above, below]
+    } else {
+        [below, above]
+    };
+    if fits(order[0]) || !fits(order[1]) {
+        order
+    } else {
+        [order[1], order[0]]
+    }
+}
+
+/// The wanted heights for the names of `tails` (each a line's last segment
+/// and its name's length), in the same order. A name takes its [`label_sides`]
+/// first choice unless another name already wants that spot, so two lines
+/// that end together get one name above and one below instead of one pushed
+/// onto its own line.
+fn label_wishes(tails: &[(Point, Point, usize)], plot: &PlotBox) -> Vec<f32> {
+    let mut by_end: Vec<usize> = (0..tails.len()).collect();
+    by_end.sort_by(|a, b| tails[*a].1.y.total_cmp(&tails[*b].1.y));
+    let mut wishes = vec![0.0; tails.len()];
+    let mut taken: Vec<f32> = Vec::new();
+    for i in by_end {
+        let (from, end, chars) = tails[i];
+        let [first, other] = label_sides(from, end, chars, plot);
+        let free = |y: f32| taken.iter().all(|t| (t - y).abs() >= LABEL_GAP);
+        let y = if free(first) || !free(other) {
+            first
+        } else {
+            other
+        };
+        taken.push(y);
+        wishes[i] = y;
+    }
+    wishes
 }
 
 /// Rows for names wanting the sorted `wanted` heights: spread so they stay apart and inside
@@ -3548,6 +3605,75 @@ mod tests {
         assert_eq!(labels, ["0.01%", "0.1%", "1%", "10%", "100%"]);
     }
 
+    // Each name's box, ending 4 px inside the right edge, clears its own
+    // line's last segment (also where the line meets the edge) and the other
+    // names, whether the line rises or falls and near the top and bottom.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn distortion_names_clear_their_lines_and_each_other() {
+        let plot = sized(500.0, 300.0);
+        let (right, mid) = (plot.right(), plot.top + 150.0);
+        let near = |dy: f32| Point::new(right, mid + dy);
+        // (segment start, end): rising, falling, a rising and a falling one close,
+        // one at the top and one at the bottom edge.
+        let tails = [
+            (Point::new(right - 60.0, mid + 50.0), near(0.0)),
+            (Point::new(right - 60.0, mid - 80.0), near(-8.0)),
+            (Point::new(right - 60.0, mid + 60.0), near(60.0)),
+            (Point::new(right - 60.0, mid + 20.0), near(66.0)),
+            // Two rising lines ending almost together.
+            (Point::new(right - 60.0, mid - 95.0), near(-100.0)),
+            (Point::new(right - 60.0, mid - 92.0), near(-97.0)),
+            (
+                Point::new(right - 60.0, plot.top + 30.0),
+                Point::new(right, plot.top),
+            ),
+            (
+                Point::new(right - 60.0, plot.bottom() - 30.0),
+                Point::new(right, plot.bottom()),
+            ),
+        ];
+        let mut order: Vec<usize> = (0..tails.len()).collect();
+        let wish = label_wishes(
+            &tails.iter().map(|(f, e)| (*f, *e, 3)).collect::<Vec<_>>(),
+            &plot,
+        );
+        order.sort_by(|a, b| wish[*a].total_cmp(&wish[*b]));
+        let sorted: Vec<f32> = order.iter().map(|i| wish[*i]).collect();
+        let rows = label_rows(&sorted, &plot).unwrap();
+        let width = 3.0 * LABEL_WIDTH_PER_CHAR;
+        let boxes: Vec<(usize, Rectangle)> = order
+            .iter()
+            .zip(&rows)
+            .map(|(i, y)| {
+                let r = Rectangle::new(
+                    Point::new(right - 4.0 - width, y - LABEL_SIZE / 2.0),
+                    Size::new(width, LABEL_SIZE),
+                );
+                (*i, r)
+            })
+            .collect();
+        for (i, r) in &boxes {
+            assert!(r.y >= plot.top && r.y + r.height <= plot.bottom(), "{r:?}");
+            let (from, end) = tails[*i];
+            // Sample along the segment, which is thicker than a hairline.
+            for k in 0..=100 {
+                let t = k as f32 / 100.0;
+                let p = Point::new(from.x + (end.x - from.x) * t, from.y + (end.y - from.y) * t);
+                let grown = Rectangle {
+                    x: r.x,
+                    y: r.y - THD_WIDTH / 2.0,
+                    width: r.width,
+                    height: r.height + THD_WIDTH,
+                };
+                assert!(!grown.contains(p), "label {i} {r:?} on its line at {p:?}");
+            }
+        }
+        for pair in boxes.windows(2) {
+            assert!(pair[1].1.y >= pair[0].1.y + pair[0].1.height, "{pair:?}");
+        }
+    }
+
     // A curve's name sits where its drawn line ends: none for a harmonic
     // wholly outside the zoomed view, the edge crossing for one leaving it.
     // Bugs caught: 0, False positives: 0
@@ -3572,15 +3698,15 @@ mod tests {
         let rising = Curve::new("H2", Ink::Fg, &rising, &fundamental, Units::Db);
         let plot = sized(500.0, 400.0).with_decades(3.0, 2000f64.log10());
         let top = 0.0;
-        assert_eq!(line_end(&curve_runs(&early, &plot, top, true)), None);
-        let end = line_end(&curve_runs(&rising, &plot, top, true)).unwrap();
+        assert_eq!(line_tail(&curve_runs(&early, &plot, top, true)), None);
+        let (_, end) = line_tail(&curve_runs(&rising, &plot, top, true)).unwrap();
         assert!((end.x - plot.right()).abs() < 1e-3, "{end:?}");
         // Between the levels at 800 Hz and 3 kHz, not the one at 800 Hz.
         let at_800 = plot.y_of(-60.0, top);
         assert!(end.y < at_800 - 1.0, "{end:?}");
         // Wholly above a zoomed level axis: cut, so no name either.
         let low = PlotBox { span: 10.0, ..plot };
-        assert_eq!(line_end(&curve_runs(&rising, &low, -70.0, false)), None);
+        assert_eq!(line_tail(&curve_runs(&rising, &low, -70.0, false)), None);
     }
 
     /// The graph with a flat 80 dB trace, zoomed in on both axes of a
