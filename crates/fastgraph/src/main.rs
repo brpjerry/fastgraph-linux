@@ -36,7 +36,26 @@ fn exit_after_first_frame() -> bool {
     *EXIT
 }
 
+/// The answer to `--version` or `--help`, printed without opening a window or
+/// connecting to the audio server; `None` starts the app.
+fn cli(args: impl IntoIterator<Item = String>) -> Option<String> {
+    match args.into_iter().nth(1).as_deref() {
+        Some("--version" | "-V") => Some(format!("fastgraph {}", env!("CARGO_PKG_VERSION"))),
+        Some("--help" | "-h") => Some(format!(
+            "fastgraph {}\nHeadphone frequency-response measurement for PipeWire.\n\n\
+             Usage: fastgraph [--version | --help]\n\n\
+             Run without options to open the window (needs Wayland and PipeWire).",
+            env!("CARGO_PKG_VERSION")
+        )),
+        _ => None,
+    }
+}
+
 fn main() -> iced::Result {
+    if let Some(text) = cli(std::env::args()) {
+        println!("{text}");
+        return Ok(());
+    }
     iced::application(App::boot, App::update, App::view)
         .title("fastgraph")
         .theme(App::theme)
@@ -53,4 +72,28 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn version_and_help_answer_without_starting_the_app() {
+        let version = cli(args(&["fastgraph", "--version"])).unwrap();
+        assert_eq!(version, format!("fastgraph {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(cli(args(&["fastgraph", "-V"])), Some(version));
+        assert!(
+            cli(args(&["fastgraph", "--help"]))
+                .unwrap()
+                .contains("Usage: fastgraph")
+        );
+        assert!(cli(args(&["fastgraph", "-h"])).is_some());
+        assert_eq!(cli(args(&["fastgraph"])), None);
+    }
 }

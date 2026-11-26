@@ -1,5 +1,6 @@
-pkgname=fastgraph-git
-pkgver=r0.g000000000000
+pkgname=fastgraph
+# Must equal the workspace version in Cargo.toml; the release is tagged v$pkgver.
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Headphone frequency-response measurement for PipeWire, with a Wayland GUI'
 arch=('x86_64')
@@ -17,20 +18,15 @@ depends=('glibc' 'libgcc' 'libpipewire' 'pipewire' 'pipewire-audio'
 makedepends=('cargo' 'clang' 'pkgconf' 'python' 'git')
 optdepends=('xdg-desktop-portal: file dialogs (with a FileChooser backend such as xdg-desktop-portal-gtk, -kde or -gnome)'
             'vulkan-driver: GPU rendering (falls back to the CPU renderer without one)')
-provides=('fastgraph')
-conflicts=('fastgraph')
+conflicts=('fastgraph-git')
 options=('!lto' '!debug')
-source=("git+https://github.com/brpjerry/fastgraph-linux.git")
+source=("fastgraph-linux::git+https://github.com/brpjerry/fastgraph-linux.git#tag=v$pkgver")
 sha256sums=('SKIP')
 # The one supported target (arch is x86_64 only). Naming it on every Cargo
 # call keeps a configured build.target from moving the binary away from the
 # path package() installs.
 _target="$CARCH-unknown-linux-gnu"
 
-pkgver() {
-    cd "$srcdir/fastgraph-linux"
-    printf "r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=12 HEAD)"
-}
 
 prepare() {
     cd "$srcdir/fastgraph-linux"

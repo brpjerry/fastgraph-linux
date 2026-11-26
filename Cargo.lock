@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "fastgraph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fastgraph-core",
  "iced",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "fastgraph-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "hound",

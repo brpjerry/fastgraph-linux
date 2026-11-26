@@ -13,6 +13,12 @@ jobs:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed git rust clang pkgconf python libpipewire wayland libxkbcommon fontconfig
       - uses: actions/checkout@v4
+      - name: PKGBUILD version matches Cargo
+        run: |
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "PKGBUILD $pkgver, Cargo $cargo_version"
+          test "$pkgver" = "$cargo_version"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
