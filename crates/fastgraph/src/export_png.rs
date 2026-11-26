@@ -12,7 +12,7 @@ use fastgraph_core::set::safe_file_name;
 use iced::advanced::renderer::{self, Headless};
 use iced::futures::FutureExt as _;
 use iced::widget::{
-    Space, button, center, checkbox, column, container, opaque, row, text, text_input,
+    Space, button, center, checkbox, column, container, opaque, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Size, Task, Theme};
 use iced_runtime::user_interface::{self, UserInterface};
@@ -24,8 +24,8 @@ pub const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
 /// The least and the most pixels on a side.
 pub const MIN_SIDE: u32 = 320;
 pub const MAX_SIDE: u32 = 8192;
-/// The image is drawn at this logical size or larger, scaled up to fill
-/// bigger images, so text and lines keep their weight against the plot.
+/// The size beyond which the image is drawn scaled up, so text and lines
+/// keep their weight against the plot; a smaller image is drawn at scale 1.
 const BASE: Size = Size::new(1920.0, 1080.0);
 /// How far from zero the level fields reach, in dB and in degrees, and the
 /// percent range: further out the grid would have no lines worth drawing.
@@ -194,7 +194,12 @@ impl Options {
     /// both of a pair whose minimum is not below its maximum.
     pub fn invalid(&self) -> Vec<Field> {
         let mut bad = Vec::new();
-        let hz = |t: &str| parse_hz(t).filter(|f| (F_MIN..=F_MAX).contains(f));
+        // Compared in decades, as drawn: frequencies equal there are no range.
+        let hz = |t: &str| {
+            parse_hz(t)
+                .filter(|f| (F_MIN..=F_MAX).contains(f))
+                .map(f64::log10)
+        };
         let mut pair = |low: Option<f64>, high: Option<f64>, fields: [Field; 2]| match (low, high) {
             (Some(l), Some(h)) if l < h => {}
             (Some(_), Some(_)) => bad.extend(fields),
@@ -234,8 +239,10 @@ impl Options {
         let low = parse_hz(&self.freq_min)?.log10();
         let high = parse_hz(&self.freq_max)?.log10();
         let level = Range::new(self.level(&self.level_min)?, self.level(&self.level_max)?);
-        let untouched =
-            |(min, max): &(String, String)| min == &self.level_min && max == &self.level_max;
+        // The fit's numbers, however they are spelled.
+        let untouched = |(min, max): &(String, String)| {
+            self.level(min) == Some(level.low) && self.level(max) == Some(level.high)
+        };
         Some(Checked {
             freq: Range::new(low, high),
             level,
@@ -285,7 +292,7 @@ pub fn render(graph: &Graph, prefs: &Prefs, size: (u32, u32), rows: bool) -> Vec
     let logical = Size::new(size.0 as f32 / scale, size.1 as f32 / scale);
     // Ready at once (the wgpu half declines "tiny-skia" before any await),
     // so it is polled here rather than run on an executor: this runs on
-    // the runtime's thread pool.
+    // the worker thread.
     let mut renderer =
         <iced::Renderer as Headless>::new(theme::ui(), theme::TEXT.into(), Some("tiny-skia"))
             .now_or_never()
@@ -390,20 +397,31 @@ impl App {
         ));
     }
 
-    /// The view or its units changed under an open panel: its axes follow,
-    /// its size and legend stay.
+    /// The view or its level's unit changed under an open panel: its axes
+    /// follow, its size as typed and its legend stay. Otherwise it is left
+    /// as typed.
     pub(crate) fn png_refill(&mut self) {
-        if let Some(o) = &self.png {
-            let size = o.size().unwrap_or(DEFAULT_SIZE);
-            let legend = o.legend;
-            self.png = Some(Options::of(
+        let unit = Unit::of(self.graph_view, self.units);
+        let Some(o) = self
+            .png
+            .as_mut()
+            .filter(|o| o.view != self.graph_view || o.unit != unit)
+        else {
+            return;
+        };
+        // The size as typed, valid or not.
+        let (width, height) = (std::mem::take(&mut o.width), std::mem::take(&mut o.height));
+        *o = Options {
+            width,
+            height,
+            ..Options::of(
                 &self.graph,
                 self.graph_view,
                 self.units,
-                size,
-                legend,
-            ));
-        }
+                DEFAULT_SIZE,
+                o.legend,
+            )
+        };
     }
 
     /// The legend's rows for the current view: the shown measurements it
@@ -419,7 +437,7 @@ impl App {
         match self.graph_view {
             View::Response => shown
                 .map(trace)
-                .chain(self.live_display().map(|_| LegendEntry {
+                .chain(self.rta.live.as_ref().map(|_| LegendEntry {
                     name: LIVE_NAME.into(),
                     ink: Ink::Fg,
                     dashed: true,
@@ -437,7 +455,7 @@ impl App {
         }
     }
 
-    /// Export: draw the view with the panel's options off the UI thread and
+    /// Export: draw the view with the panel's options on the worker and
     /// write it to the exports folder, or where the save dialog says when
     /// "Ask where to export" is on.
     fn png_export(&mut self) -> Task<Message> {
@@ -457,25 +475,35 @@ impl App {
             Ok(dir) => dir,
             Err(e) => return Task::done(Message::Exported(Err(format!("{e:#}")))),
         };
-        let ask = self.prefs.ask_export;
-        if !ask {
+        // On the worker, so exports finish in the order asked for and the
+        // close waits for them.
+        let job = move |path: PathBuf, dir: Option<PathBuf>| -> crate::store_queue::Job {
+            Box::new(move || {
+                let saved = write(&graph, &prefs, checked, rows, &path, dir.as_deref());
+                Some(Message::Exported(saved))
+            })
+        };
+        if !self.prefs.ask_export {
             self.info(format!("Exporting {name}…"));
+            self.worker.submit(job(dir.join(&name), Some(dir)));
+            return Task::none();
         }
+        // The dialog is not on the worker; what it picks is queued there,
+        // unless the window has closed meanwhile.
+        let worker = self.worker.sender();
         Task::future(async move {
-            if !ask {
-                let path = dir.join(&name);
-                return Some(write(&graph, &prefs, checked, rows, &path, Some(&dir)));
-            }
             let file = rfd::AsyncFileDialog::new()
                 .set_title("Export PNG")
                 .set_directory(&dir)
                 .set_file_name(name)
                 .add_filter("PNG image", &["png"])
                 .save_file()
-                .await?;
-            Some(write(&graph, &prefs, checked, rows, file.path(), None))
+                .await;
+            if let (Some(file), Some(worker)) = (file, worker.upgrade()) {
+                let _ = worker.send(job(file.path().to_path_buf(), None));
+            }
         })
-        .and_then(|saved| Task::done(Message::Exported(saved)))
+        .discard()
     }
 }
 
@@ -591,6 +619,15 @@ pub fn panel(o: &Options) -> Element<'_, Message> {
     .spacing(12)
     .width(Length::Fixed(420.0));
     let card = container(card).padding(16).style(theme::card);
+    // Where the graph is smaller than the card, the card scrolls.
+    let card = scrollable(card)
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        })
+        .width(Length::Shrink)
+        .height(Length::Shrink)
+        .style(theme::scrollbar);
     opaque(center(card).style(scrim))
 }
 
@@ -842,6 +879,77 @@ mod tests {
         };
         assert_eq!(pixel(&light), expect(ThemeMode::Light));
         assert_eq!(pixel(&Prefs::default()), expect(ThemeMode::Dark));
+    }
+
+    // A long name in a narrow image is shortened to fit the legend: nothing
+    // of it reaches past the plot's right edge.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_long_legend_name_stays_inside_a_narrow_image() {
+        let graph = graph();
+        let size = (320, 320);
+        let rows = vec![LegendEntry {
+            name: "SENNHEISER HD 600 LEFT CUP, SEAL ADJUSTED, TAKE 12".into(),
+            ink: Ink::Trace(0),
+            dashed: false,
+            thick: false,
+        }];
+        let checked = Options::of(&graph, View::Response, Units::Percent, size, true)
+            .checked()
+            .unwrap();
+        let draw = |legend: Option<Vec<LegendEntry>>| {
+            let export = Export {
+                pins: checked.pins,
+                legend,
+            };
+            let copy = graph.export_copy(checked.freq, checked.level, export);
+            render(&copy, &Prefs::default(), size, true)
+        };
+        let (with_legend, without) = (draw(Some(rows)), draw(None));
+        let plot = PlotBox::inside(size.0 as f32, size.1 as f32, INSETS);
+        let from = plot.right().ceil() as usize + 2;
+        let w = size.0 as usize;
+        let differ = (0..size.1 as usize)
+            .flat_map(|y| (from..w).map(move |x| (y * w + x) * 4))
+            .filter(|&at| with_legend[at..at + 4] != without[at..at + 4])
+            .count();
+        assert_eq!(differ, 0);
+        assert_ne!(with_legend, without);
+    }
+
+    // A level typed as the same number, "10.0" for "10", keeps the fit
+    // pinned; another number does not.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn an_equal_level_keeps_the_fit_pinned() {
+        let fit = Options::of(&graph(), View::Response, Units::Percent, DEFAULT_SIZE, true);
+        assert!(fit.checked().unwrap().pins);
+        for (field, text) in [
+            (Field::LevelMin, &fit.level_min),
+            (Field::LevelMax, &fit.level_max),
+        ] {
+            let same = if text.contains('.') {
+                format!(" {text}0")
+            } else {
+                format!("{text}.0")
+            };
+            let o = with(fit.clone(), field, &same);
+            assert!(o.checked().unwrap().pins, "{same}");
+        }
+        let other: f64 = fit.level_max.parse().unwrap();
+        let o = with(fit, Field::LevelMax, &(other + 1.0).to_string());
+        assert!(!o.checked().unwrap().pins);
+    }
+
+    // Two frequencies that differ in Hz but not in decades, as drawn, are no
+    // range.
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn frequencies_equal_in_decades_are_no_range() {
+        let o = with(options(), Field::FreqMin, "1000");
+        let o = with(o, Field::FreqMax, "1000.0000000000001");
+        assert_eq!(o.invalid(), [Field::FreqMin, Field::FreqMax]);
+        assert!(o.checked().is_none());
     }
 
     // Bugs caught: 0, False positives: 0

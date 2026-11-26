@@ -178,8 +178,9 @@ end of the controls line when the window is too narrow for it there. A panel ove
 sets the image:
 
 - **Frequency** and **Level**: the axis ranges, filled in from the view as shown, zoom
-  included. Level is in dB, ° in Phase, or % in Distortion %. Frequencies stay within
-  20 Hz–20 kHz.
+  included. Frequencies stay within 20 Hz–20 kHz. Level is in dB from −1000 to 1000, in ° in
+  Phase from −100,000 to 100,000, or in % in Distortion % from 0.000000001 to 1,000,000,000. A
+  very narrow custom range can fall between the grid marks and show few or none of them.
 - **Size**: 1280 × 720, 1920 × 1080 (the default) or 3840 × 2160, or any width and height from
   320 to 8192 px. Larger images are drawn at a larger scale, so text and lines keep their
   weight.
@@ -188,7 +189,7 @@ sets the image:
 
 A field that doesn't hold a valid value shows in red, and **Export** stays unavailable until it
 does; a minimum must be below its maximum. The image uses the current appearance and shows the
-graph without the hover readout or **Reset view**. It is drawn in the background and written to
+graph without the hover readout, the scroll bars or **Reset view**. It is drawn in the background and written to
 `<exports folder>/<set> - <view>.png` (`<view>.png` without a set name), or a save dialog opens
 if "Ask where to export" is on. **Cancel** or Esc closes the panel.
 

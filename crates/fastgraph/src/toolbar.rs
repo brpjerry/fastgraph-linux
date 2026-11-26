@@ -116,10 +116,14 @@ fn label_width(content: &str) -> f32 {
 /// at their full `tabs` width; else it ends the controls, so the tabs keep
 /// their width.
 pub fn png_on_tabs_line(width: f32, tabs: f32) -> bool {
-    let buttons: f32 = LINE_ONE
-        .iter()
-        .map(|l| label_width(l).ceil() + 2.0 * BUTTON_PAD + 1.0)
-        .sum();
+    // The labels and the font are fixed: measured once.
+    static BUTTONS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let buttons = BUTTONS.get_or_init(|| {
+        LINE_ONE
+            .iter()
+            .map(|l| label_width(l).ceil() + 2.0 * BUTTON_PAD + 1.0)
+            .sum()
+    });
     tabs + LINE_ONE_SPACING * LINE_ONE.len() as f32 + buttons <= width
 }
 

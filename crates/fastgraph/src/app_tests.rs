@@ -4274,3 +4274,213 @@ fn render_png_exports() {
         .unwrap();
     }
 }
+
+/// The width and height of the PNG file at `path`.
+fn png_size(path: &Path) -> (u32, u32) {
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+    let info = decoder.read_info().unwrap();
+    (info.info().width, info.info().height)
+}
+
+// Two exports to one file name end with the later one, whatever order the
+// runtime finishes their tasks in, and closing the window waits for both.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn png_exports_finish_in_order_and_closing_waits_for_them() {
+    use crate::export_png::{Event, Field};
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = plain(None);
+    app.prefs.exports_dir = Some(dir.path().to_path_buf());
+    app.prefs.ask_export = false;
+    heard(&mut app, 0.0, false);
+    // Hold the worker, so both exports are still pending.
+    let (open, gate) = std::sync::mpsc::channel::<()>();
+    app.worker.submit(Box::new(move || {
+        let _ = gate.recv();
+        None
+    }));
+    let mut tasks = Vec::new();
+    for (width, height) in [("1280", "720"), ("640", "360")] {
+        let _ = app.update(Message::Png(Event::Open));
+        let _ = app.update(Message::Png(Event::Input(Field::Width, width.into())));
+        let _ = app.update(Message::Png(Event::Input(Field::Height, height.into())));
+        tasks.push(app.update(Message::Png(Event::Export)));
+    }
+    let file = dir.path().join("Response.png");
+    assert!(!file.exists(), "all still pending");
+    open.send(()).unwrap();
+    // The later task first.
+    for task in tasks.into_iter().rev() {
+        for message in outputs(task) {
+            let _ = app.update(message);
+        }
+    }
+    let _ = app.update(Message::CloseRequested);
+    assert_eq!(png_size(&file), (640, 360));
+}
+
+// Clear closes an open Export PNG panel, and on an otherwise empty session
+// the open panel is something for it to do.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn clear_closes_the_png_panel() {
+    use crate::export_png::Event;
+    let data = tempfile::tempdir().unwrap();
+    let mut app = plain(data_in(&data));
+    run(&mut app, Message::Png(Event::Open));
+    assert!(!app.is_pristine());
+    run(&mut app, Message::Clear);
+    assert!(app.png.is_none());
+    assert!(app.is_pristine());
+    heard(&mut app, 0.0, false);
+    run(&mut app, Message::GraphViewSelected(graph::View::Phase));
+    run(&mut app, Message::Png(Event::Open));
+    run(&mut app, Message::Clear);
+    assert!(app.items.is_empty(), "{}", app.status.text);
+    assert_eq!(app.graph_view, graph::View::Response);
+    assert!(app.png.is_none());
+}
+
+// In a window too short for it, the panel scrolls to its Export button;
+// where it fits, it sits centred over the graph.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn the_png_panel_scrolls_in_a_short_window() {
+    use crate::export_png::Event;
+    let mut app = plain(None);
+    heard(&mut app, 0.0, false);
+    run(&mut app, Message::Png(Event::Open));
+    {
+        let mut ui = crate::testing::ui(crate::testing::SIZE, app.view());
+        let label = ui.find("Frequency").unwrap().bounds();
+        let export = ui.find("Export").unwrap().bounds();
+        // The card's padding, and the button's beside its label.
+        let card = (label.x - 16.0, export.x + export.width + 10.0 + 16.0);
+        let main = (devices::WIDTH + 1.0 + 8.0, crate::testing::SIZE.0 - 8.0);
+        let centre = |(a, b): (f32, f32)| (a + b) / 2.0;
+        assert!((centre(card) - centre(main)).abs() < 2.0, "{card:?}");
+    }
+    let size = (1280.0, 420.0);
+    let mut ui = crate::testing::ui(size, app.view());
+    let row = ui.find("L seat 1").unwrap().bounds();
+    let label = ui.find("Frequency").unwrap().bounds();
+    ui.point_at(iced::Point::new(label.center_x(), label.center_y()));
+    ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -20.0 },
+    })]);
+    // Shown whole above the list, not squeezed to nothing.
+    let export = ui.find("Export").unwrap();
+    let shown = export.visible_bounds().unwrap_or_default();
+    assert!(shown.height > 10.0, "{export:?}");
+    assert!(
+        (shown.height - export.bounds().height).abs() < 0.1,
+        "{export:?}"
+    );
+    assert!(shown.y + shown.height <= row.y, "{export:?} over {row:?}");
+}
+
+// Picking the tab or units already shown leaves the typed fields; a real
+// change refills the axes and keeps the size as typed, even half typed.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn the_png_panel_refills_only_when_the_view_changes() {
+    use crate::export_png::{Event, Field};
+    let mut app = plain(None);
+    heard(&mut app, 0.0, false);
+    run(&mut app, Message::Png(Event::Open));
+    run(
+        &mut app,
+        Message::Png(Event::Input(Field::FreqMin, "100".into())),
+    );
+    run(&mut app, Message::GraphViewSelected(graph::View::Response));
+    let units = app.units;
+    run(&mut app, Message::UnitsPicked(units));
+    assert_eq!(app.png.as_ref().unwrap().freq_min, "100");
+    run(
+        &mut app,
+        Message::Png(Event::Input(Field::Width, "".into())),
+    );
+    run(
+        &mut app,
+        Message::Png(Event::Input(Field::Height, "777".into())),
+    );
+    run(&mut app, Message::GraphViewSelected(graph::View::Phase));
+    let o = app.png.as_ref().unwrap();
+    assert_eq!(o.view, graph::View::Phase);
+    assert_eq!(o.freq_min, "20");
+    assert_eq!((o.width.as_str(), o.height.as_str()), ("", "777"));
+    assert!(o.checked().is_none());
+}
+
+/// The messages the app's subscriptions give for a press of Escape.
+fn escape_pressed(app: &App) -> Vec<Message> {
+    use iced::advanced::subscription::{self, Event};
+    use iced::futures::FutureExt as _;
+    use iced::keyboard::{Event::KeyPressed, Key, Location, Modifiers, key};
+    let escape = Event::Interaction {
+        window: iced::window::Id::unique(),
+        event: iced::Event::Keyboard(KeyPressed {
+            key: Key::Named(key::Named::Escape),
+            modified_key: Key::Named(key::Named::Escape),
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }),
+        status: iced::event::Status::Ignored,
+    };
+    // The events subscription would take the worker's receiver.
+    let receiver = app.events.0.lock().unwrap().take();
+    let mut messages = Vec::new();
+    for recipe in subscription::into_recipes(app.subscription()) {
+        let mut stream = recipe.stream(iced::futures::stream::iter([escape.clone()]).boxed());
+        while let Some(Some(message)) = stream.next().now_or_never() {
+            messages.push(message);
+        }
+    }
+    *app.events.0.lock().unwrap() = receiver;
+    messages
+}
+
+// Escape closes the Export PNG panel before it cancels a rename under it;
+// the next Escape cancels the rename.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn escape_closes_the_png_panel_before_a_rename() {
+    use crate::export_png::Event;
+    let mut app = plain(None);
+    heard(&mut app, 0.0, false);
+    let item = id(&app, 0);
+    run(&mut app, Message::RenameStart(item));
+    run(&mut app, Message::RenameInput("Other".into()));
+    run(&mut app, Message::Png(Event::Open));
+    let pressed = escape_pressed(&app);
+    for message in pressed {
+        run(&mut app, message);
+    }
+    assert!(app.png.is_none());
+    assert_eq!(app.renaming.as_ref().map(|r| r.1.as_str()), Some("Other"));
+    let pressed = escape_pressed(&app);
+    for message in pressed {
+        run(&mut app, message);
+    }
+    assert!(app.renaming.is_none());
+}
+
+// The legend names the live RTA trace while one is shown.
+// Bugs caught: 0, False positives: 0
+#[test]
+fn the_legend_names_the_live_trace() {
+    let mut app = plain(None);
+    heard(&mut app, 0.0, false);
+    let names = |app: &App| {
+        app.legend_rows()
+            .into_iter()
+            .map(|r| r.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&app), ["L seat 1"]);
+    app.rta.live = Some((flat(70.0), 10));
+    assert_eq!(names(&app), ["L seat 1", crate::export_png::LIVE_NAME]);
+}

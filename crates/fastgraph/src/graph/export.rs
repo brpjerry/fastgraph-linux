@@ -216,13 +216,19 @@ pub(super) fn draw_legend(
         (rows.len(), 0)
     };
     let font = theme::ui();
+    // Within the legend's widest box, shortened further where they need it.
+    let name_room = plot.width - 2.0 * (MARGIN + PAD) - SAMPLE - GAP;
     let names: Vec<String> = rows[..shown]
         .iter()
         .map(|r| {
-            cut(
-                &r.name.split_whitespace().collect::<Vec<_>>().join(" "),
-                NAME_CHARS,
-            )
+            let name = r.name.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut name = cut(&name, NAME_CHARS);
+            let mut chars = name.chars().count();
+            while chars > 1 && text_width(&name, font, TEXT_SIZE) > name_room {
+                chars -= 1;
+                name = cut(&name, chars);
+            }
+            name
         })
         .collect();
     let more = (more > 0).then(|| format!("+{more} more"));

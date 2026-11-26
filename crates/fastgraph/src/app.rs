@@ -1480,6 +1480,7 @@ impl App {
             && self.pane == Pane::Measure
             && self.graph_view == graph::View::Response
             && !self.graph.any_zoomed()
+            && self.png.is_none()
     }
 
     /// The Clear button: end any activity and return the session to its
@@ -1511,6 +1512,7 @@ impl App {
         self.selected = None;
         self.distortion.clear();
         self.renaming = None;
+        self.png = None;
         self.offset_texts.clear();
         self.set_name.clear();
         self.saved_as = None;
@@ -1833,8 +1835,8 @@ impl App {
         // Ticks time out a measurement.
         let tick =
             (matches!(self.state, Activity::Measuring { .. })).then(|| Subscription::run(ticks));
-        // Escape cancels a rename.
-        let escape = self.renaming.is_some().then(|| {
+        // Escape cancels a rename, once the Export PNG panel over it is closed.
+        let escape = (self.renaming.is_some() && self.png.is_none()).then(|| {
             iced::event::listen_with(|event, _, _| match event {
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
