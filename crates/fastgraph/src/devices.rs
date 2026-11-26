@@ -61,7 +61,11 @@ pub(crate) fn caption<'a>(content: String) -> iced::widget::Text<'a> {
         .style(theme::text(|p| p.fg_dim))
 }
 
-fn segment(label: &str, selected: bool, on_press: Option<Message>) -> Element<'_, Message> {
+pub(crate) fn segment(
+    label: &str,
+    selected: bool,
+    on_press: Option<Message>,
+) -> Element<'_, Message> {
     button(text(label).align_x(Alignment::Center).width(Length::Fill))
         .on_press_maybe(on_press)
         .padding([4, 10])

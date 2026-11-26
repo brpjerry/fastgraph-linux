@@ -190,7 +190,12 @@ Your settings are kept. Unsaved work stays available under **Unsaved sessions**.
   Leave a folder empty to use the default (see Files). `~/` is accepted; other relative paths
   are not.
 - **Ask where to save** and **Ask where to export**: show a file dialog for Save and Export.
-- **Accent colour** and **Trace colours**: `#rrggbb` values, each with a **Reset** button.
+- **Appearance**: **Dark** (the default) or **Light**. It applies at once. Each appearance has
+  its own default accent and trace colours; Light's are darker so they read on white.
+- **Accent colour** and **Trace colours**: `#rrggbb` values. A custom accent is kept across
+  appearances. Entering any one trace colour saves all eight as they are shown, so all eight
+  then stay the same across appearances. Each **Reset** button restores the current
+  appearance's default accent or trace colours.
 
 ### Keyboard
 

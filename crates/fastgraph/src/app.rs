@@ -328,6 +328,8 @@ pub enum Message {
     BrowseExportsDir,
     ExportsDirPicked(Option<PathBuf>),
     AskExport(bool),
+    /// The Appearance segments.
+    ThemePicked(theme::ThemeMode),
     /// The accent box, and back to the default.
     AccentInput(String),
     AccentSubmit,
@@ -590,7 +592,7 @@ impl App {
             path
         });
         let settings = Inputs::new(&prefs);
-        let theme = settings::build_theme(&prefs);
+        let theme = theme::from_prefs(&prefs);
         App {
             prefs,
             prefs_writable: false,
@@ -926,6 +928,7 @@ impl App {
             | Message::BrowseExportsDir
             | Message::ExportsDirPicked(_)
             | Message::AskExport(_)
+            | Message::ThemePicked(_)
             | Message::AccentInput(_)
             | Message::AccentSubmit
             | Message::AccentReset

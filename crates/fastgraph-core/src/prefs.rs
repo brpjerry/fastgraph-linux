@@ -37,6 +37,16 @@ pub struct Prefs {
     pub align_hz: f64,
     /// Width of the alignment band; 0 aligns at the single point.
     pub align_octaves: f64,
+    /// Dark or light appearance.
+    pub theme: ThemeMode,
+}
+
+/// The app's appearance. Files written before it existed load as `Dark`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
 }
 
 impl Default for Prefs {
@@ -62,6 +72,7 @@ impl Default for Prefs {
             trace_colors: None,
             align_hz: 1000.0,
             align_octaves: 0.0,
+            theme: ThemeMode::Dark,
         }
     }
 }
@@ -298,6 +309,7 @@ mod tests {
             trace_colors: Some(vec!["#000000".into(); 8]),
             align_hz: 2500.0,
             align_octaves: 0.5,
+            theme: ThemeMode::Light,
         };
         p.save(&f).unwrap();
         assert_eq!(Prefs::load(&f).unwrap(), p);
@@ -324,6 +336,19 @@ mod tests {
         assert_eq!(p.accent, None);
         assert_eq!(p.trace_colors, None);
         assert_eq!(p.level_db, -20.0);
+        assert_eq!(p.theme, ThemeMode::Dark);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn theme_mode_is_saved_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("p.toml");
+        std::fs::write(&f, "theme = \"Light\"\n").unwrap();
+        assert_eq!(Prefs::load(&f).unwrap().theme, ThemeMode::Light);
+        Prefs::default().save(&f).unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("theme = \"Dark\""), "{text}");
     }
 
     // Bugs caught: 0, False positives: 0

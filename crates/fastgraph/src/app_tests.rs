@@ -2,6 +2,7 @@
 use super::*;
 use crate::browser::Pane;
 use crate::rta_mode::Sent;
+use crate::theme::{Palette, ThemeMode};
 use fastgraph_core::deconv::ImpulseResponse;
 use fastgraph_core::response::{Response, Smoothing, average, log_grid};
 use fastgraph_core::store::Kind;
@@ -1500,6 +1501,60 @@ fn render_snapshots() {
             snapshot_sized(&app, &format!("header-{name}-{width}"), (width, 800.0));
         }
     }
+
+    // Every tab and graph view in both appearances.
+    let saves = tempfile::tempdir().unwrap();
+    for name in ["Velour pads", "Leather pads"] {
+        write_pads(saves.path(), name, "Left");
+    }
+    run(
+        &mut app,
+        Message::SetsDirPicked(Some(saves.path().to_path_buf())),
+    );
+    for n in 0..app.items.len() {
+        let item = id(&app, n);
+        app.distortion
+            .insert(item, distortion_at(-60.0 + 10.0 * n as f64));
+    }
+    // A selected row, and a hover card on each plot.
+    let first = id(&app, 0);
+    run(&mut app, Message::Select(first));
+    for (mode, tag) in [(ThemeMode::Dark, "dark"), (ThemeMode::Light, "light")] {
+        run(&mut app, Message::ThemePicked(mode));
+        run(&mut app, Message::PaneSelected(Pane::Measure));
+        for (view, name, hover) in [
+            (graph::View::Response, "response", 4.0),
+            (graph::View::Phase, "phase", -90.0),
+            (graph::View::Distortion, "distortion", -1.0),
+        ] {
+            run(&mut app, Message::GraphViewSelected(view));
+            run(
+                &mut app,
+                Message::Graph(graph::Event::Hover(graph::Hover::At {
+                    freq: 2900.0,
+                    db: hover,
+                })),
+            );
+            app.now += Duration::from_secs(1);
+            snapshot(&app, &format!("{tag}-measure-{name}"));
+        }
+        // Zoomed in %: Reset view, the finer grid and its labels in this
+        // appearance's colours.
+        run(
+            &mut app,
+            wheel(graph::Axis::Frequency, plot.right() - 50.0, 3.0),
+        );
+        run(&mut app, wheel(graph::Axis::Level, plot.top + 300.0, 3.0));
+        run(&mut app, hover(15_000.0, 0.5));
+        snapshot(&app, &format!("{tag}-measure-distortion-zoomed"));
+        run(&mut app, Message::Graph(graph::Event::Reset));
+        run(&mut app, Message::GraphViewSelected(graph::View::Response));
+        for (pane, name) in [(Pane::Sets, "sets"), (Pane::Settings, "settings")] {
+            run(&mut app, Message::PaneSelected(pane));
+            app.now += Duration::from_secs(1);
+            snapshot(&app, &format!("{tag}-{name}"));
+        }
+    }
 }
 
 // Bugs caught: 0, False positives: 1
@@ -2546,11 +2601,133 @@ fn settings_tab_renders_its_sections() {
     for label in [
         "Sets folder",
         "Exports folder",
+        "Appearance",
+        "Dark",
+        "Light",
         "Accent colour",
         "Trace colours",
     ] {
         assert!(crate::testing::shows(app.view(), label), "{label}");
     }
+}
+
+// Bugs caught: 0, False positives: 0
+#[test]
+fn the_appearance_segments_pick_the_mode() {
+    let mut app = plain(None);
+    run(&mut app, Message::PaneSelected(Pane::Settings));
+    let sent = click(app.view(), "Light");
+    assert!(
+        matches!(sent[..], [Message::ThemePicked(ThemeMode::Light)]),
+        "{sent:?}"
+    );
+}
+
+// The mode applies at once: a new theme, the light palette, the mode's
+// default colours in the boxes, and the graph's cached strokes redrawn.
+// Bugs caught: 0, False positives: 0
+#[test]
+fn switching_the_appearance_rebuilds_the_theme_and_redraws_the_graph() {
+    let mut app = plain(None);
+    heard(&mut app, 0.0, false);
+    let draws = |app: &App| {
+        crate::testing::ui(crate::testing::SIZE, app.view())
+            .snapshot(&app.theme())
+            .expect("headless render");
+        app.graph.drawn.get()
+    };
+    let dark = Palette::of(&app.theme());
+    assert_eq!(dark, Palette::default());
+    let before = draws(&app);
+
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    assert_eq!(app.prefs.theme, ThemeMode::Light);
+    let light = Palette::of(&app.theme());
+    assert_eq!(light, Palette::from_prefs(&app.prefs));
+    assert_ne!(light.bg, dark.bg);
+    assert_eq!(light.accent, theme::ACCENT_LIGHT);
+    assert_eq!(app.settings.accent, theme::to_hex(theme::ACCENT_LIGHT));
+    assert_eq!(app.settings.traces, light.traces.map(theme::to_hex));
+    let after = draws(&app);
+    assert_eq!(after, before + 1, "redrawn in the light colours");
+    // Picking the shown mode again changes nothing.
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    assert_eq!(draws(&app), after);
+
+    // A custom accent stays through a switch back.
+    run(&mut app, Message::AccentInput("#30a0f0".into()));
+    run(&mut app, Message::AccentSubmit);
+    let custom = draws(&app);
+    run(&mut app, Message::ThemePicked(ThemeMode::Dark));
+    let p = Palette::of(&app.theme());
+    assert_eq!(p.bg, dark.bg);
+    assert_eq!(Some(p.accent), theme::parse_hex("#30a0f0"));
+    assert_eq!(app.settings.accent, "#30a0f0");
+    assert_eq!(draws(&app), custom + 1);
+}
+
+// A colour typed but not yet entered survives a switch; a box that shows the
+// old appearance's colour takes the new one, also where a saved colour is
+// invalid and the default is drawn in its place.
+// Bugs caught: 0, False positives: 0
+#[test]
+fn switching_the_appearance_keeps_typed_colours_and_updates_shown_ones() {
+    let mut app = plain(None);
+    run(&mut app, Message::AccentInput("#30a0".into()));
+    run(&mut app, Message::TraceColorInput(2, "#00ff00".into()));
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    let light = Palette::of(&app.theme());
+    assert_eq!(
+        light,
+        Palette::new(ThemeMode::Light, theme::ACCENT_LIGHT, None)
+    );
+    assert_eq!(app.settings.accent, "#30a0");
+    for (i, shown) in app.settings.traces.iter().enumerate() {
+        let want = if i == 2 {
+            "#00ff00".to_string()
+        } else {
+            theme::to_hex(light.traces[i])
+        };
+        assert_eq!(*shown, want, "trace {i}");
+    }
+
+    let prefs = Prefs {
+        accent: Some("#zz".into()),
+        trace_colors: Some(vec!["#123456".into(); 3]),
+        ..Prefs::default()
+    };
+    let mut app = App::new_for_test(prefs, None);
+    assert_eq!(app.settings.accent, theme::to_hex(theme::ACCENT));
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    let light = Palette::of(&app.theme());
+    assert_eq!(
+        light,
+        Palette::new(ThemeMode::Light, theme::ACCENT_LIGHT, None)
+    );
+    assert_eq!(app.settings.accent, theme::to_hex(light.accent));
+    assert_eq!(app.settings.traces, light.traces.map(theme::to_hex));
+}
+
+// The RTA average stays drawn after Stop, dashed in the foreground colour:
+// a new appearance redraws it at the same window size.
+// Bugs caught: 1, False positives: 0
+#[test]
+fn switching_the_appearance_redraws_a_stopped_rta_average() {
+    let mut app = rta_ready(None);
+    run(&mut app, Message::RtaListen(true));
+    run(&mut app, rta_event(-30.0, 12));
+    run(&mut app, Message::RtaListen(false));
+    assert!(app.rta.live.is_some(), "the average stays after Stop");
+    let draws = |app: &App| {
+        crate::testing::ui(crate::testing::SIZE, app.view())
+            .snapshot(&app.theme())
+            .expect("headless render");
+        app.graph.live_drawn.get()
+    };
+    let before = draws(&app);
+    assert_eq!(draws(&app), before, "cached");
+    run(&mut app, Message::ThemePicked(ThemeMode::Light));
+    assert_eq!(draws(&app), before + 1, "redrawn in the light foreground");
 }
 
 /// A response tilting 6 dB per octave through 0 dB at 1 kHz.
@@ -2911,7 +3088,7 @@ fn selecting_a_row_highlights_it() {
     run(&mut app, sent.into_iter().next().unwrap());
     assert_eq!(app.selected, Some(want.clone()));
     let p = theme::Palette::default();
-    let theme = theme::with_colors(theme::ACCENT, None);
+    let theme = theme::with_colors(ThemeMode::Dark, theme::ACCENT, None);
     assert_eq!(
         theme::row_fill(true)(&theme).background,
         Some(p.selected.into())
