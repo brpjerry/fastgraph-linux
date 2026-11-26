@@ -36,8 +36,12 @@ pub struct Palette {
     pub bg: Color,
     /// Popups: menus.
     pub bg_raised: Color,
-    /// Input fields, and resting fills of controls.
+    /// Resting fill for controls such as pickers and checkboxes.
     pub bg_overlay: Color,
+    /// Text box fill.
+    pub input_bg: Color,
+    /// Text box outline at rest.
+    pub input_border: Color,
     /// 1 px hairline between surfaces.
     pub border: Color,
     /// A hovered or focused control's border.
@@ -75,6 +79,8 @@ impl Palette {
             bg,
             bg_raised: color!(0x141414),
             bg_overlay: color!(0x1e1e1e),
+            input_bg: color!(0x111111),
+            input_border: color!(0x3c3c3c),
             border: color!(0x2e2e2e),
             border_focus: darken(accent, 0.48),
             fg,
@@ -367,18 +373,51 @@ fn tint(p: &Palette, status: widget::button::Status) -> Option<Color> {
     }
 }
 
-/// A text box style that draws its text in the error colour while `valid` is
-/// false.
+/// The shared text box style: a dark fill, a hairline rounded outline that
+/// takes the accent on focus, and the error colour for text while invalid.
 pub fn input_checked(
     valid: bool,
 ) -> impl Fn(&Theme, widget::text_input::Status) -> widget::text_input::Style {
     move |theme, status| {
-        let mut style = widget::text_input::default(theme, status);
-        if !valid {
-            style.value = Palette::of(theme).err;
+        let p = Palette::of(theme);
+        // Dark edges are lightened toward the text colours so they show on the fill.
+        let visible_edge = |color, toward| {
+            if luminance(color) <= luminance(p.fg_faint) {
+                mix(color, toward, 0.65)
+            } else {
+                color
+            }
+        };
+        let edge = match status {
+            widget::text_input::Status::Focused { .. } => visible_edge(p.accent, p.fg),
+            widget::text_input::Status::Hovered => visible_edge(p.border_focus, p.fg_dim),
+            _ => p.input_border,
+        };
+        let disabled = status == widget::text_input::Status::Disabled;
+        widget::text_input::Style {
+            background: if disabled { p.bg } else { p.input_bg }.into(),
+            border: border(edge),
+            icon: p.fg_dim,
+            placeholder: if disabled { p.disabled } else { p.fg_dim },
+            value: if !valid {
+                p.err
+            } else if disabled {
+                p.disabled
+            } else {
+                p.fg
+            },
+            selection: if valid {
+                mix(p.input_bg, p.fg, 0.4)
+            } else {
+                mix(p.input_bg, p.err, 0.24)
+            },
         }
-        style
     }
+}
+
+/// The text box style for boxes with no validity check.
+pub fn input(theme: &Theme, status: widget::text_input::Status) -> widget::text_input::Style {
+    input_checked(true)(theme, status)
 }
 
 /// A plain button: a hairline frame, secondary
@@ -648,6 +687,49 @@ mod tests {
 
     // Bugs caught: 0, False positives: 0
     #[test]
+    fn text_boxes_are_outlined_and_filled_apart_from_buttons_and_background() {
+        let theme = with_colors(ACCENT, None);
+        let p = Palette::of(&theme);
+        let button_fills = [
+            widget::button::Status::Active,
+            widget::button::Status::Hovered,
+            widget::button::Status::Pressed,
+        ]
+        .map(|s| button(&theme, s).background);
+        for status in [
+            widget::text_input::Status::Active,
+            widget::text_input::Status::Hovered,
+            widget::text_input::Status::Focused { is_hovered: false },
+        ] {
+            let style = input(&theme, status);
+            assert!(style.border.width > 0.0);
+            assert_eq!(style.background, Background::Color(p.input_bg));
+            assert_eq!(p.input_bg.a, 1.0);
+            assert_eq!(style.border.color.a, 1.0);
+            assert_eq!(style.border.width, HAIRLINE);
+            assert_eq!(style.border.radius, RADIUS.into());
+            let fill = style.background;
+            assert_ne!(fill, p.bg.into());
+            for b in button_fills {
+                assert_ne!(Some(fill), b);
+            }
+            for fill_of in [p.hover, p.pressed, p.selected, p.accent_dim, p.accent] {
+                assert_ne!(fill, fill_of.into());
+            }
+        }
+        let focused = input(
+            &theme,
+            widget::text_input::Status::Focused { is_hovered: false },
+        );
+        assert_eq!(focused.border.color, p.accent);
+        let resting = input(&theme, widget::text_input::Status::Active);
+        assert!(contrast(resting.border.color, p.input_bg) >= 1.5);
+        let invalid = input_checked(false)(&theme, widget::text_input::Status::Active);
+        assert_eq!(invalid.value, p.err);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
     fn text_status_and_trace_colours_read_on_their_surfaces() {
         let p = Palette::default();
         for surface in [p.bg, p.bg_raised, p.bg_overlay, p.hover, p.selected] {
@@ -665,6 +747,56 @@ mod tests {
             assert!(contrast(trace, p.border) >= 3.0, "trace {i} on a grid line");
         }
         assert!(contrast(p.accent_fg, p.accent) >= 4.5);
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn text_box_text_selection_and_placeholder_read_on_the_fill() {
+        let theme = with_colors(ACCENT, None);
+        let p = Palette::of(&theme);
+        let active = widget::text_input::Status::Active;
+        let ok = input(&theme, active);
+        assert!(contrast(ok.selection, p.input_bg) >= 1.5);
+        assert!(contrast(ok.value, ok.selection) >= 3.0);
+        let bad = input_checked(false)(&theme, active);
+        assert!(contrast(bad.selection, p.input_bg) >= 1.2);
+        assert!(contrast(bad.value, bad.selection) >= 3.0);
+        assert_eq!(ok.placeholder, p.fg_dim);
+        assert!(contrast(ok.placeholder, p.input_bg) >= 4.5);
+        let off = input(&theme, widget::text_input::Status::Disabled);
+        assert_eq!(off.placeholder, p.disabled);
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn a_disabled_text_box_uses_the_window_fill_and_keeps_the_error_colour() {
+        let theme = with_colors(ACCENT, None);
+        let p = Palette::of(&theme);
+        let off = input(&theme, widget::text_input::Status::Disabled);
+        assert_eq!(off.background, Background::Color(p.bg));
+        assert_eq!(off.value, p.disabled);
+        let bad = input_checked(false)(&theme, widget::text_input::Status::Disabled);
+        assert_eq!(bad.background, Background::Color(p.bg));
+        assert_eq!(bad.value, p.err);
+    }
+
+    // Bugs caught: 1, False positives: 0
+    #[test]
+    fn hover_and_focus_edges_show_on_a_dark_accent() {
+        let theme = with_colors(parse_hex("#000080").unwrap(), None);
+        let p = Palette::of(&theme);
+        let hover = input(&theme, widget::text_input::Status::Hovered)
+            .border
+            .color;
+        let focus = input(
+            &theme,
+            widget::text_input::Status::Focused { is_hovered: false },
+        )
+        .border
+        .color;
+        assert!(contrast(hover, p.input_bg) >= 1.5, "hover");
+        assert!(contrast(focus, p.input_bg) >= 1.5, "focus");
+        assert!(luminance(focus) > luminance(hover));
     }
 
     // A dark custom accent still carries readable labels and checkmarks.
