@@ -2388,7 +2388,7 @@ fn import_button_adds() {
     assert!(names(&app).contains(&"Velour"));
 }
 
-// Bugs caught: 0, False positives: 0
+// Bugs caught: 1, False positives: 0
 #[test]
 fn unsaved_sessions_are_listed() {
     let data = tempfile::tempdir().unwrap();
@@ -2425,6 +2425,12 @@ fn unsaved_sessions_are_listed() {
         matches!(sent.as_slice(), [Message::OpenSet(p)] if *p == old),
         "{sent:?}"
     );
+    // The status names it the same way, not by its file name.
+    for message in sent {
+        run(&mut app, message);
+    }
+    assert!(app.status.text.contains(&label), "{}", app.status.text);
+    assert!(!app.status.text.contains("2000"), "{}", app.status.text);
 }
 
 // Bugs caught: 0, False positives: 0

@@ -2,7 +2,7 @@
 //! and the sessions earlier runs left unsaved, to open or import.
 use crate::app::{App, Message};
 use crate::{devices, tabs, theme};
-use fastgraph_core::curve_io::utc_string;
+use fastgraph_core::curve_io::local_time_string;
 use fastgraph_core::set::SetHeader;
 use iced::widget::{button, column, row, rule, scrollable, text};
 use iced::{Alignment, Element, Length};
@@ -24,11 +24,10 @@ const PANES: [(Pane, &str); 3] = [
     (Pane::Settings, "Settings"),
 ];
 
-/// `YYYY-MM-DD HH:MM UTC` for a header's `saved` seconds. The time is UTC
-/// because local time needs a time-zone dependency.
+/// A header's `saved` seconds as local date and time, in the locale's
+/// date and time format.
 pub fn saved_label(secs: u64) -> String {
-    let full = utc_string(UNIX_EPOCH + Duration::from_secs(secs));
-    format!("{} UTC", full.chars().take(16).collect::<String>())
+    local_time_string(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 fn count_label(count: usize) -> String {

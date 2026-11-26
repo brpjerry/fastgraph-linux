@@ -58,6 +58,11 @@ fn main() -> iced::Result {
         println!("{text}");
         return Ok(());
     }
+    // Dates follow the user's `LC_TIME`.
+    // SAFETY: called once at start-up, before any other thread exists.
+    unsafe {
+        libc::setlocale(libc::LC_TIME, c"".as_ptr());
+    }
     iced::application(App::boot, App::update, App::view)
         .title("fastgraph")
         .theme(App::theme)

@@ -1555,7 +1555,11 @@ impl App {
                 return self.error(format!("Set not {verb}: {e}"));
             }
         };
-        let label = header.title(&path);
+        let label = if header.name.is_empty() && self.in_recovery_dir(&path) {
+            format!("Unsaved · {}", browser::saved_label(header.saved))
+        } else {
+            header.title(&path)
+        };
         let n = entries.len();
         // `read_set` adds one problem, not an entry's, when the count is off.
         let unreadable = problems.len() - usize::from(n != header.count);

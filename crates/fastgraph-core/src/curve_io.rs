@@ -95,7 +95,10 @@ pub fn write_rew(resp: &Response, header: &ExportHeader) -> String {
     if header.offset_db != 0.0 {
         out.push_str(&format!("* Offset: {:+.1} dB\n", header.offset_db));
     }
-    out.push_str(&format!("* Dated: {}\n", utc_string(header.created)));
+    out.push_str(&format!(
+        "* Dated: {}\n",
+        one_line(&local_time_string(header.created))
+    ));
     out.push_str("*\n");
     out.push_str(if phase.is_some() {
         "* Freq(Hz) SPL(dB) Phase(degrees)\n"
@@ -113,6 +116,39 @@ pub fn write_rew(resp: &Response, header: &ExportHeader) -> String {
         }
     }
     out
+}
+
+/// `t` in the local time zone, as the locale's date and time of day (`%x %X`;
+/// under en_US, `11/14/2023 10:13:20 PM`). The locale comes from `LC_TIME`
+/// once the program has called `setlocale(LC_TIME, "")`; before that it is
+/// the "C" locale.
+pub fn local_time_string(t: SystemTime) -> String {
+    let secs = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let format: &[u8] = b"%x %X\0";
+    let time = secs as libc::time_t;
+    // SAFETY: `localtime_r` fills `tm`, and `strftime` writes at most
+    // `buf.len()` bytes and reports how many.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&time, &mut tm).is_null() {
+            return "unknown time".to_owned();
+        }
+        let mut buf = [0u8; 256];
+        let n = libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            format.as_ptr().cast(),
+            &tm,
+        );
+        // 0 means the text did not fit; non-UTF-8 comes from a legacy locale.
+        match std::str::from_utf8(&buf[..n]) {
+            Ok(text) if n > 0 => text.to_owned(),
+            _ => "unknown time".to_owned(),
+        }
+    }
 }
 
 /// `YYYY-MM-DD HH:MM:SS UTC`.
@@ -251,7 +287,8 @@ mod tests {
             assert!(text.starts_with("* fastgraph export\n"));
             assert!(text.contains("* Smoothing: 1/12"));
             assert!(text.contains("* Compensation: Coupler"));
-            assert!(text.contains("* Dated: 2023-11-14 22:13:20 UTC"));
+            let dated = format!("* Dated: {}\n", local_time_string(header().created));
+            assert!(text.contains(&dated));
             let back = read_curve(&text).unwrap();
             assert_eq!(back.freq.len(), r.freq.len());
             for i in 0..r.freq.len() {
@@ -299,5 +336,34 @@ mod tests {
             utc_string(UNIX_EPOCH + Duration::from_secs(951_782_400 + 86_399)),
             "2000-02-29 23:59:59 UTC"
         );
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn local_time_follows_tz() {
+        // TZ is process-wide, so each zone is checked in its own process.
+        if let Ok(zone) = std::env::var("FASTGRAPH_TZ_CHILD") {
+            let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            // The "C" locale's `%x %X`; the zone shifts the hour.
+            let expected = match zone.as_str() {
+                "UTC0" => "11/14/23 22:13:20",
+                _ => "11/14/23 17:13:20",
+            };
+            assert_eq!(local_time_string(t), expected);
+            return;
+        }
+        for zone in ["UTC0", "EST5"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "curve_io::tests::local_time_follows_tz"])
+                .env("FASTGRAPH_TZ_CHILD", zone)
+                .env("TZ", zone)
+                .env_remove("LC_ALL")
+                .env_remove("LC_TIME")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{zone}: {out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("1 passed"), "{zone}: child did not run");
+        }
     }
 }
