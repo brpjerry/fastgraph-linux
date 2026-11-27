@@ -3,6 +3,8 @@
 A small, fast headphone frequency-response measurement tool for Linux, using PipeWire and a
 Wayland-native window.
 
+![fastgraph showing the left, right and average response of a pair of headphones](assets/screenshot.png)
+
 ## Features
 
 - Log-sweep measurement played from this computer, or from any other device (a phone, a
